@@ -16,7 +16,7 @@ source venv/bin/activate <br/>
 python main.py <br/>
 
 # Testing
-I started some unit tests. To run them: 
+I started some unit tests. To run them: <br/>
 python3 -m venv venv <br/>
 source venv/bin/activate <br/>
 python main_test.py <br/>
