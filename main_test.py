@@ -42,11 +42,41 @@ import unittest
 # Mutable fixture state the stub db functions read/write. Tests reset its
 # *contents* in setUp() (rather than rebinding it) so the stub functions
 # defined once below always see the current test's data.
-STATE = {"player": {}, "port": {}, "trade_log": []}
+STATE = {
+    "player": {},
+    "port": {},
+    "trade_log": [],
+    "upgrade_log": [],
+    # Per-sector fixtures for the navigation/docking tests below. Left
+    # empty by the port-trade and Stardock tests above, which only ever
+    # care about one port (whichever sector the player is currently
+    # standing in) and don't exercise movement at all.
+    "ports": {},
+    "warps": {},
+}
 
 
 def _stub_get_port(sector_id):
+    # Navigation tests populate "ports" per sector_id; everything else
+    # uses the single "port" fixture regardless of which sector_id is
+    # asked for, since those tests only ever have the player docked in
+    # one place.
+    if STATE["ports"]:
+        port = STATE["ports"].get(sector_id)
+        return dict(port) if port is not None else None
     return dict(STATE["port"])
+
+
+def _stub_get_adjacent_sectors(sector_id):
+    return list(STATE["warps"].get(sector_id, []))
+
+
+def _stub_get_all_warps():
+    return {k: list(v) for k, v in STATE["warps"].items()}
+
+
+def _stub_move_player_to_sector(player_id, sector_id):
+    STATE["player"]["sector_id"] = sector_id
 
 
 def _stub_get_player_with_ship(pubkey):
@@ -60,7 +90,14 @@ def _stub_get_or_create_player(pubkey, sender):
 def _stub_execute_trade(player_id, port_id, key, qty, total_price, player_is_buying):
     STATE["trade_log"].append((key, qty, total_price, player_is_buying))
     player = STATE["player"]
-    port = STATE["port"]
+    # Mutate the actual backing dict (not a get_port()-returned copy) so
+    # the change is visible on the next get_port() call. The per-sector
+    # "ports" fixture (navigation tests) is looked up by id; everything
+    # else just has the one "port" fixture regardless of port_id.
+    if STATE["ports"]:
+        port = next(p for p in STATE["ports"].values() if p["id"] == port_id)
+    else:
+        port = STATE["port"]
     if player_is_buying:
         player[key] += qty
         player["credits"] -= total_price
@@ -71,6 +108,13 @@ def _stub_execute_trade(player_id, port_id, key, qty, total_price, player_is_buy
         port[f"{key}_qty"] += qty
 
 
+def _stub_upgrade_ship_stat(player_id, stat_column, qty, total_price):
+    STATE["upgrade_log"].append((stat_column, qty, total_price))
+    player = STATE["player"]
+    player[stat_column] += qty
+    player["credits"] -= total_price
+
+
 def _install_stub_modules():
     db_stub = types.ModuleType("db")
     db_stub.init_db = lambda: None
@@ -78,11 +122,16 @@ def _install_stub_modules():
     db_stub.get_or_create_player = _stub_get_or_create_player
     db_stub.reset_turns_if_needed = lambda *a, **k: None
     db_stub.get_player_with_ship = _stub_get_player_with_ship
-    db_stub.get_adjacent_sectors = lambda sector_id: []
-    db_stub.get_all_warps = lambda: {}
+    db_stub.get_adjacent_sectors = _stub_get_adjacent_sectors
+    db_stub.get_all_warps = _stub_get_all_warps
     db_stub.get_port = _stub_get_port
-    db_stub.move_player_to_sector = lambda *a, **k: None
+    db_stub.move_player_to_sector = _stub_move_player_to_sector
     db_stub.execute_trade = _stub_execute_trade
+    db_stub.upgrade_ship_stat = _stub_upgrade_ship_stat
+    db_stub.SHIP_MAX_HOLDS = 75
+    db_stub.SHIP_MAX_FIGHTERS = 50
+    db_stub.SHIP_MAX_SHIELDS = 200
+    db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25}
     sys.modules["db"] = db_stub
 
     meshcore_stub = types.ModuleType("meshcore")
@@ -156,6 +205,9 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
         STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ports"] = {}
+        STATE["warps"] = {}
 
     def ctx(self):
         """A fresh Ctx wired to whatever STATE['player'] currently holds --
@@ -288,6 +340,367 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(PUBKEY, main.PENDING_TRADES)
         self.assertEqual(STATE["player"]["equipment"], 15)  # unchanged
         self.assertEqual(STATE["trade_log"], [])
+
+
+class StardockRefitFlowTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Covers the Stardock refit flow added to cmd_trade/cmd_stardock_step:
+    docking at a STARDOCK port opens an open-ended menu (buy cargo holds,
+    fighters, or shields) rather than the commodity-trade queue, and the
+    menu reappears after every purchase/skip so multiple stats can be
+    upgraded in one visit.
+    """
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ports"] = {}
+        STATE["warps"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def dock(self):
+        return await main.cmd_trade(self.ctx(), "")
+
+    async def say(self, message):
+        return await main.cmd_stardock_step(self.ctx(), message)
+
+    async def test_dock_shows_refit_menu_with_current_max_and_price(self):
+        STATE["player"] = fresh_player(credits=5000, holds_total=20, fighters=10, shields=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        prompt = await self.dock()
+
+        self.assertIn("Stardock refits:", prompt)
+        self.assertIn("Cargo Holds 20/75 @ 500cr each", prompt)
+        self.assertIn("Fighters 10/50 @ 50cr each", prompt)
+        self.assertIn("Shields 10/200 @ 25cr each", prompt)
+        self.assertIn("5000cr available", prompt)
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)
+
+    async def test_buy_fighters_full_flow_then_returns_to_menu(self):
+        STATE["player"] = fresh_player(credits=5000, fighters=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+
+        # Choose option 2 (Fighters). Room to cap is 40 (50-10) and
+        # affordability is 100 (5000/50cr) -- room is the binding limit.
+        prompt = await self.say("2")
+        self.assertIn("Fighters: 10/50, 50cr each.", prompt)
+        self.assertIn("Buy how many? (0-40, or 'cancel')", prompt)
+
+        prompt = await self.say("10")
+        self.assertIn("Buy 10 Fighters for 500cr (50cr/unit)? yes/no", prompt)
+
+        prompt = await self.say("yes")
+        self.assertIn("Installed 10 Fighters for -500cr.", prompt)
+        # Back at the menu, reflecting the purchase, ready for another.
+        self.assertIn("Stardock refits:", prompt)
+        self.assertIn("Fighters 20/50 @ 50cr each", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["fighters"], 20)
+        self.assertEqual(final["credits"], 5000 - 500)
+        self.assertEqual(STATE["upgrade_log"], [("fighters", 10, 500)])
+        # Visit stays open after a purchase, so more can be bought.
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")
+
+    async def test_quantity_capped_by_affordability_not_just_ship_cap(self):
+        """100cr only buys 2 fighters at 50cr each, even though there's
+        plenty of room left under the 50-fighter cap."""
+        STATE["player"] = fresh_player(credits=100, fighters=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("2")  # Fighters
+
+        self.assertIn("Buy how many? (0-2, or 'cancel')", prompt)
+
+    async def test_quantity_above_max_is_rejected(self):
+        STATE["player"] = fresh_player(credits=5000, shields=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("3")  # Shields: room=190, afford=200 -> max 190
+        prompt = await self.say("9999")
+
+        self.assertIn("Max is 190. Enter a smaller quantity, or 'cancel'.", prompt)
+        self.assertEqual(STATE["player"]["shields"], 10)  # nothing bought yet
+
+    async def test_quantity_zero_returns_to_menu_without_buying(self):
+        STATE["player"] = fresh_player(credits=5000, shields=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("3")  # Shields
+        prompt = await self.say("0")
+
+        self.assertIn("Stardock refits:", prompt)
+        self.assertEqual(STATE["player"]["shields"], 10)
+        self.assertEqual(STATE["upgrade_log"], [])
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)  # visit still open
+
+    async def test_no_at_confirm_returns_to_menu_without_buying(self):
+        STATE["player"] = fresh_player(credits=5000, holds_total=20)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("1")    # Cargo Holds
+        await self.say("5")    # quote 5 holds
+        prompt = await self.say("no")
+
+        self.assertIn("Stardock refits:", prompt)
+        self.assertEqual(STATE["player"]["holds_total"], 20)  # unchanged
+        self.assertEqual(STATE["upgrade_log"], [])
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)
+
+    async def test_cancel_ends_the_visit_from_the_menu(self):
+        STATE["player"] = fresh_player(credits=5000)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("cancel")
+
+        self.assertEqual(prompt, "Left the Stardock.")
+        self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
+
+    async def test_cancel_ends_the_visit_mid_purchase(self):
+        """'cancel' works at the quantity/confirm stages too, not just
+        from the top-level menu."""
+        STATE["player"] = fresh_player(credits=5000, fighters=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("2")     # Fighters
+        await self.say("5")     # quote 5
+        prompt = await self.say("cancel")
+
+        self.assertEqual(prompt, "Left the Stardock.")
+        self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
+        self.assertEqual(STATE["player"]["fighters"], 10)  # unchanged
+        self.assertEqual(STATE["upgrade_log"], [])
+
+    async def test_stat_already_at_cap_is_rejected(self):
+        STATE["player"] = fresh_player(credits=100000, holds_total=75)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("1")  # Cargo Holds, already at the 75 cap
+
+        self.assertIn("Already at max Cargo Holds (75).", prompt)
+        self.assertIn("Stardock refits:", prompt)  # re-shows the menu
+        # Still on the menu stage -- the rejected pick never advanced state.
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")
+
+    async def test_cant_afford_even_one_unit_is_rejected(self):
+        STATE["player"] = fresh_player(credits=10, fighters=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("2")  # Fighters @ 50cr each, only 10cr on hand
+
+        self.assertIn("Can't afford even 1 Fighters (50cr each).", prompt)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")
+
+    async def test_invalid_menu_choice_is_rejected(self):
+        STATE["player"] = fresh_player(credits=5000)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+
+        prompt = await self.say("9")  # out of range -- only 3 options exist
+        self.assertIn("Not a valid option.", prompt)
+
+        prompt = await self.say("not-a-number")
+        self.assertIn("Reply with a number to buy, or 'cancel'.", prompt)
+
+    async def test_multiple_purchases_in_one_visit(self):
+        """Buying holds, then fighters, in the same visit -- the menu
+        loop should let a player upgrade more than one stat per dock."""
+        STATE["player"] = fresh_player(credits=5000, holds_total=20, fighters=10)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("1")     # Cargo Holds
+        await self.say("2")     # buy 2 holds @ 500cr = 1000cr
+        await self.say("yes")
+        await self.say("2")     # Fighters
+        await self.say("4")     # buy 4 fighters @ 50cr = 200cr
+        prompt = await self.say("yes")
+
+        final = STATE["player"]
+        self.assertEqual(final["holds_total"], 22)
+        self.assertEqual(final["fighters"], 14)
+        self.assertEqual(final["credits"], 5000 - 1000 - 200)
+        self.assertEqual(
+            STATE["upgrade_log"],
+            [("holds_total", 2, 1000), ("fighters", 4, 200)],
+        )
+        self.assertIn("Stardock refits:", prompt)
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)  # visit still open
+
+
+class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Covers docking partway through a multi-hop plotted course (the
+    cmd_confirm_warp 'p'/'port' branch, and the _resume_navigation_suffix
+    helper it relies on). Scenario mirrors the worked example from the
+    design discussion: starting in Sec1, with Sec2 and Sec3 adjacent but
+    Sec4 two hops away via Sec3, a player routes to Sec4, gets routed
+    through Sec3 first, and docks there before continuing on.
+
+    Warp graph used throughout: 1<->2, 1<->3, 3<->4 (so Sec4 is only
+    reachable via Sec3, making the BFS route deterministic).
+    """
+
+    WARPS = {1: [2, 3], 2: [1], 3: [1, 4], 4: [3]}
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ports"] = {}
+        STATE["warps"] = dict(self.WARPS)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def plot_route_to_4(self):
+        """Sec1 -> Sec4 isn't a direct warp, so this always plots the
+        2-hop Sec1->Sec3->Sec4 route and leaves it awaiting confirmation."""
+        return await main.cmd_move(self.ctx(), "4")
+
+    async def test_docking_at_intermediate_sector_then_resuming_route(self):
+        STATE["player"] = fresh_player(sector_id=1, credits=10000)
+        STATE["ports"] = {
+            3: fresh_port(
+                "SSS",
+                fuel_ore_dir="S", fuel_ore_price=10, fuel_ore_qty=500, fuel_ore_max=1000,
+            )
+        }
+
+        # 1. Plot the route -- Sec4 isn't adjacent to Sec1, so this goes
+        # through the BFS/confirmation path rather than moving directly.
+        prompt = await self.plot_route_to_4()
+        self.assertIn("Plotted a 2-warp course to Sec4.", prompt)
+        self.assertIn("Warp to: 1 -> 3 -> 4? (yes/no)", prompt)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [3, 4])
+
+        # 2. Confirm the first hop -- arrives at Sec3, which has a port,
+        # and is asked to confirm the next (final) hop to Sec4.
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
+        self.assertEqual(STATE["player"]["sector_id"], 3)
+        self.assertIn("Warped to Sec3.", prompt)
+        self.assertIn("Port: SSS", prompt)
+        self.assertIn("Warps: 1, 4", prompt)
+        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+        # 3. Instead of yes/no, dock at Sec3's port -- the route to Sec4
+        # must stay queued while this happens.
+        prompt = await main.cmd_confirm_warp(self.ctx(), "p")
+        self.assertIn("Fuel Ore", prompt)
+        self.assertIn(PUBKEY, main.PENDING_TRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])  # untouched
+
+        # 4. Buy some fuel ore -- the only item in this port's queue, so
+        # the visit closes itself out, and the dropped-back-into route
+        # confirmation should be appended automatically.
+        await main.cmd_trade_step(self.ctx(), "5")
+        prompt = await main.cmd_trade_step(self.ctx(), "yes")
+        self.assertIn("Bought 5 Fuel Ore for -50cr (10cr/unit).", prompt)
+        self.assertIn("Nothing more to trade here.", prompt)
+        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_TRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])  # route still open
+
+        # 5. Pick the route back up -- arrives at the original Sec4
+        # destination and the route is finally cleared.
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
+        self.assertEqual(STATE["player"]["sector_id"], 4)
+        self.assertIn("Arrived at Sec4.", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_WARPS)
+
+    async def test_cancelling_the_dock_mid_route_resumes_navigation_prompt(self):
+        STATE["player"] = fresh_player(sector_id=1, credits=10000)
+        STATE["ports"] = {
+            3: fresh_port(
+                "SSS",
+                fuel_ore_dir="S", fuel_ore_price=10, fuel_ore_qty=500, fuel_ore_max=1000,
+            )
+        }
+
+        await self.plot_route_to_4()
+        await main.cmd_confirm_warp(self.ctx(), "yes")  # arrive at Sec3
+        await main.cmd_confirm_warp(self.ctx(), "p")    # dock
+
+        prompt = await main.cmd_trade_step(self.ctx(), "cancel")
+
+        self.assertEqual(prompt, "Trade cancelled.\n\nWarp to: 3 -> 4? (yes/no)")
+        self.assertNotIn(PUBKEY, main.PENDING_TRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+    async def test_docking_with_nothing_to_trade_reshows_prompt_immediately(self):
+        """If the port at the stopover has nothing to offer, no trade
+        visit actually starts -- the route prompt should still come
+        back right away rather than leaving the player stuck."""
+        STATE["player"] = fresh_player(sector_id=1, credits=10000)
+        STATE["ports"] = {3: fresh_port("SSS")}  # no commodity directions set
+
+        await self.plot_route_to_4()
+        await main.cmd_confirm_warp(self.ctx(), "yes")  # arrive at Sec3
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "port")
+
+        self.assertIn("Nothing to trade with this port.", prompt)
+        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_TRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+    async def test_docking_at_a_stardock_stopover_then_resuming_route(self):
+        """Same idea, but the stopover is a Stardock -- refit purchases
+        should be able to happen mid-route too, with the same resume
+        behavior once the visit is left via 'cancel'."""
+        STATE["player"] = fresh_player(sector_id=1, credits=5000, fighters=10)
+        STATE["ports"] = {3: fresh_port("STARDOCK")}
+
+        await self.plot_route_to_4()
+        await main.cmd_confirm_warp(self.ctx(), "yes")  # arrive at Sec3
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "p")
+        self.assertIn("Stardock refits:", prompt)
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])  # untouched
+
+        await main.cmd_stardock_step(self.ctx(), "2")   # Fighters
+        await main.cmd_stardock_step(self.ctx(), "5")   # qty
+        prompt = await main.cmd_stardock_step(self.ctx(), "yes")
+        self.assertIn("Installed 5 Fighters for -250cr.", prompt)
+        self.assertIn("Stardock refits:", prompt)  # visit stays open
+        self.assertIn(PUBKEY, main.PENDING_UPGRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+        prompt = await main.cmd_stardock_step(self.ctx(), "cancel")
+        self.assertEqual(prompt, "Left the Stardock.\n\nWarp to: 3 -> 4? (yes/no)")
+        self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
+        self.assertEqual(STATE["player"]["sector_id"], 4)
+        self.assertIn("Arrived at Sec4.", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_WARPS)
 
 
 if __name__ == "__main__":

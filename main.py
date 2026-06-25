@@ -17,6 +17,11 @@ from db import (
     get_port,
     move_player_to_sector,
     execute_trade,
+    upgrade_ship_stat,
+    SHIP_MAX_HOLDS,
+    SHIP_MAX_FIGHTERS,
+    SHIP_MAX_SHIELDS,
+    STARDOCK_PRICES,
 )
 
 print("MeshCore bot started...")
@@ -49,6 +54,11 @@ PENDING_WARPS = {}
 # steps (pick item -> pick quantity -> confirm). Populated by cmd_trade,
 # consumed/advanced by cmd_trade_step.
 PENDING_TRADES = {}
+
+# pubkey -> dict tracking an in-progress Stardock refit visit (buying
+# cargo holds, fighters, or shields). Populated by cmd_trade when
+# docking at the Stardock, consumed/advanced by cmd_stardock_step.
+PENDING_UPGRADES = {}
 
 # Only one player may be "at the helm" (issuing commands) at a time.
 # There's no clean way to tell "logged out" apart from "radio out of
@@ -96,6 +106,7 @@ def _release_session(pubkey):
     global ACTIVE_SESSION
     PENDING_TRADES.pop(pubkey, None)
     PENDING_WARPS.pop(pubkey, None)
+    PENDING_UPGRADES.pop(pubkey, None)
     if ACTIVE_SESSION and ACTIVE_SESSION["pubkey"] == pubkey:
         ACTIVE_SESSION = None
 
@@ -279,6 +290,29 @@ COMMODITIES = [
 ]
 
 
+# (display label, ships column, price per unit, ship's per-stat cap) for
+# each Stardock refit option, in the fixed order shown in the refit
+# menu. The cap is the same for every player's ship in v1 (there's only
+# one ship type), so it's a plain constant here rather than something
+# pulled per-ship.
+STARDOCK_UPGRADES = [
+    ("Cargo Holds", "holds_total", STARDOCK_PRICES["holds_total"], SHIP_MAX_HOLDS),
+    ("Fighters", "fighters", STARDOCK_PRICES["fighters"], SHIP_MAX_FIGHTERS),
+    ("Shields", "shields", STARDOCK_PRICES["shields"], SHIP_MAX_SHIELDS),
+]
+
+
+def build_stardock_menu(p):
+    """The Stardock refit menu: current/max and price for each
+    upgradeable stat, shown when a player first docks and again after
+    every purchase (or skip) so they can keep buying in one visit."""
+    lines = ["Stardock refits:"]
+    for i, (label, col, price, limit) in enumerate(STARDOCK_UPGRADES, start=1):
+        lines.append(f"  {i}) {label} {p[col]}/{limit} @ {price}cr each")
+    lines.append(f"{p['credits']}cr available. Reply with a number to buy, or 'cancel'.")
+    return "\n".join(lines)
+
+
 def build_sector_info(sector_id):
     """
     The sector info screen: sector number, then port, then adjacent
@@ -286,6 +320,28 @@ def build_sector_info(sector_id):
     automatically appended whenever a player's sector actually changes.
     """
     return f"Sec{sector_id}\n{format_port_line(sector_id)}\n{format_warps_line(sector_id)}"
+
+
+def _resume_navigation_suffix(pubkey, sector_id):
+    """
+    If a multi-hop warp confirmation is still pending for pubkey,
+    return text re-prompting to continue that route -- formatted the
+    same as the original "Warp to: ...? (yes/no)" prompt, just starting
+    from the player's current sector instead of the one they set out
+    from. Returns "" if there's no route in progress.
+
+    This is what lets a player dock at a port partway through a plotted
+    multi-hop course (see cmd_confirm_warp's "p"/"port" handling)
+    without losing the rest of the route: cmd_trade_step and
+    cmd_stardock_step both call this once their visit ends, appending
+    the result to their own closing message so the player is dropped
+    straight back into the yes/no confirmation for the remaining hops.
+    """
+    remaining = PENDING_WARPS.get(pubkey)
+    if not remaining:
+        return ""
+    route = " -> ".join(str(s) for s in [sector_id] + remaining)
+    return f"\n\nWarp to: {route}? (yes/no)"
 
 
 @command("menu", "help", "?", description="list all commands")
@@ -317,11 +373,14 @@ async def cmd_status(ctx, args):
     )
 
 
-@command("p", "port", description="dock at port to trade")
+@command("p", "port", description="dock at port to trade or refit")
 async def cmd_trade(ctx, args):
     """
-    Start a guided port visit. Builds a queue of trade offers in two
-    passes, both walking COMMODITIES (fuel, organics, equipment) in order:
+    Start a guided port visit. At the Stardock (Sec1), this means a
+    refit visit -- see build_stardock_menu/cmd_stardock_step -- since
+    the Stardock deals in ship upgrades, not commodities. At any other
+    port, builds a queue of trade offers in two passes, both walking
+    COMMODITIES (fuel, organics, equipment) in order:
 
       1. SELL -- for every commodity the player is carrying that this
          port buys (direction "B"), offer to sell however many units
@@ -343,7 +402,8 @@ async def cmd_trade(ctx, args):
     if port is None:
         return "No port in current sector."
     if port["port_class"] == "STARDOCK":
-        return "No commodity trading at Stardock."
+        PENDING_UPGRADES[ctx.pubkey] = {"stage": "menu"}
+        return build_stardock_menu(p)
 
     queue = []
     for label, key in COMMODITIES:
@@ -439,7 +499,7 @@ def _advance_trade_queue(pubkey, p, port):
         if prompt is not None:
             return prompt
     PENDING_TRADES.pop(pubkey, None)
-    return "Nothing more to trade here."
+    return "Nothing more to trade here." + _resume_navigation_suffix(pubkey, p["sector_id"])
 
 
 async def cmd_trade_step(ctx, message):
@@ -475,12 +535,12 @@ async def cmd_trade_step(ctx, message):
 
     if lower == "cancel":
         PENDING_TRADES.pop(pubkey, None)
-        return "Trade cancelled."
+        return "Trade cancelled." + _resume_navigation_suffix(pubkey, p["sector_id"])
 
     port = get_port(state["sector_id"])
     if port is None or port["id"] != state["port_id"]:
         PENDING_TRADES.pop(pubkey, None)
-        return "Port no longer available. Trade cancelled."
+        return "Port no longer available. Trade cancelled." + _resume_navigation_suffix(pubkey, p["sector_id"])
 
     if state["stage"] == "quantity":
         if not re.match(r"^\d+$", text):
@@ -571,7 +631,127 @@ async def cmd_trade_step(ctx, message):
 
     # Shouldn't be reachable, but don't leave a broken trade stuck in state.
     PENDING_TRADES.pop(pubkey, None)
-    return "Something went wrong with this trade. Cancelled."
+    return "Something went wrong with this trade. Cancelled." + _resume_navigation_suffix(pubkey, p["sector_id"])
+
+
+async def cmd_stardock_step(ctx, message):
+    """
+    Advance a pending Stardock refit visit. Unlike the port trade queue
+    (which walks every tradeable commodity exactly once), the Stardock
+    menu is open-ended: after each completed or skipped purchase the
+    player is shown the menu again and can keep buying -- limited only
+    by their ship's per-stat caps (SHIP_MAX_HOLDS/FIGHTERS/SHIELDS) and
+    their credits -- until they reply 'cancel'.
+
+    Stages, in order:
+      "menu"     -- reply with the menu number of an upgrade to buy, or
+                    'cancel' to leave. Rejects a stat that's already at
+                    its cap, or one the player can't afford even 1 unit
+                    of, before moving to "quantity".
+      "quantity" -- reply with a whole number of units. 0 returns to the
+                    menu without buying. A non-zero amount, capped at
+                    state["max_qty"], moves to "confirm" with the listed
+                    total price.
+      "confirm"  -- "yes" commits the purchase and returns to the menu.
+                    Anything else (e.g. "no") returns to the menu without
+                    buying.
+    'cancel' is accepted at any stage and ends the visit.
+    """
+    pubkey = ctx.pubkey
+    text = message.strip()
+    lower = text.lower()
+
+    state = PENDING_UPGRADES.get(pubkey)
+    if not state:
+        PENDING_UPGRADES.pop(pubkey, None)
+        return "No Stardock visit in progress."
+
+    if lower == "cancel":
+        PENDING_UPGRADES.pop(pubkey, None)
+        return "Left the Stardock." + _resume_navigation_suffix(pubkey, ctx.player["sector_id"])
+
+    # Always re-fetch -- a purchase made a step ago in this same visit
+    # changes both credits and the stat just bought.
+    p = get_player_with_ship(pubkey)
+
+    if state["stage"] == "menu":
+        if not re.match(r"^\d+$", text):
+            return "Reply with a number to buy, or 'cancel'.\n\n" + build_stardock_menu(p)
+        choice = int(text)
+        if choice < 1 or choice > len(STARDOCK_UPGRADES):
+            return "Not a valid option.\n\n" + build_stardock_menu(p)
+
+        label, col, price, limit = STARDOCK_UPGRADES[choice - 1]
+        current = p[col]
+        room = limit - current
+        if room <= 0:
+            return f"Already at max {label} ({limit}).\n\n" + build_stardock_menu(p)
+
+        max_qty = max(0, min(room, p["credits"] // price))
+        if max_qty <= 0:
+            return f"Can't afford even 1 {label} ({price}cr each).\n\n" + build_stardock_menu(p)
+
+        state.update({
+            "stage": "quantity",
+            "label": label,
+            "column": col,
+            "price": price,
+            "limit": limit,
+            "max_qty": max_qty,
+        })
+        return (
+            f"{label}: {current}/{limit}, {price}cr each.\n"
+            f"Buy how many? (0-{max_qty}, or 'cancel')"
+        )
+
+    if state["stage"] == "quantity":
+        if not re.match(r"^\d+$", text):
+            return "Enter a whole number of units (0 to go back), or 'cancel'."
+        qty = int(text)
+        if qty > state["max_qty"]:
+            return f"Max is {state['max_qty']}. Enter a smaller quantity, or 'cancel'."
+        if qty == 0:
+            state["stage"] = "menu"
+            return build_stardock_menu(p)
+
+        state["qty"] = qty
+        state["total_price"] = qty * state["price"]
+        state["stage"] = "confirm"
+        return (
+            f"Buy {qty} {state['label']} for {state['total_price']}cr "
+            f"({state['price']}cr/unit)? yes/no"
+        )
+
+    if state["stage"] == "confirm":
+        if lower not in ("y", "yes"):
+            state["stage"] = "menu"
+            return build_stardock_menu(p)
+
+        col = state["column"]
+        qty = state["qty"]
+        total_price = state["total_price"]
+        label = state["label"]
+        limit = state["limit"]
+
+        # Re-validate against current state right before committing --
+        # credits or the stat's current value may have changed since the
+        # quote a step ago (only this player can act during their own
+        # visit, but this keeps the same safety margin as cmd_trade_step).
+        if total_price > p["credits"] or p[col] + qty > limit:
+            state["stage"] = "menu"
+            return "Conditions changed -- purchase skipped.\n\n" + build_stardock_menu(p)
+
+        upgrade_ship_stat(p["id"], col, qty, total_price)
+        p = get_player_with_ship(pubkey)
+        state["stage"] = "menu"
+        return (
+            f"Installed {qty} {label} for -{total_price}cr.\n\n"
+            f"{build_stardock_menu(p)}"
+        )
+
+    # Shouldn't be reachable, but don't leave a broken visit stuck in state.
+    PENDING_UPGRADES.pop(pubkey, None)
+    return "Something went wrong with this visit. Cancelled." + _resume_navigation_suffix(pubkey, ctx.player["sector_id"])
 
 
 def find_shortest_path(graph, start, goal):
@@ -645,10 +825,22 @@ async def cmd_move(ctx, args):
 
 async def cmd_confirm_warp(ctx, message):
     """
-    Handle a yes/no reply while a multi-hop warp is awaiting confirmation.
-    On "yes", advances one hop and asks again if more remain, or reports
-    arrival if that was the last one. On "no", cancels the rest of the
-    plotted course and leaves the player where they are.
+    Handle a reply while a multi-hop warp is awaiting confirmation.
+    "yes" advances one hop and asks again if more remain, or reports
+    arrival if that was the last one. "no"/"cancel" cancels the rest of
+    the plotted course and leaves the player where they are.
+
+    The port command ('p'/'port') is also accepted here: it lets the
+    player dock at the sector they've just warped into -- regular
+    trading, or a Stardock refit if it's Sec1 -- without losing the
+    rest of the route. PENDING_WARPS is left untouched while that visit
+    runs (cmd_trade starts its own PENDING_TRADES/PENDING_UPGRADES,
+    which on_message checks ahead of PENDING_WARPS, so follow-up
+    messages go to the visit, not back here). Once the visit ends,
+    cmd_trade_step/cmd_stardock_step append this same yes/no prompt via
+    _resume_navigation_suffix so the player is dropped straight back
+    into the route. If docking didn't actually start a visit (no port,
+    or nothing to trade), the prompt is re-shown immediately instead.
     """
     p = ctx.player
     pubkey = ctx.pubkey
@@ -658,6 +850,16 @@ async def cmd_confirm_warp(ctx, message):
     if not remaining:
         PENDING_WARPS.pop(pubkey, None)
         return "No warp in progress."
+
+    verb, args = parse(text)
+    if verb in COMMANDS and COMMANDS[verb][1] is cmd_trade:
+        response = await cmd_trade(ctx, args)
+        if pubkey not in PENDING_TRADES and pubkey not in PENDING_UPGRADES:
+            # Nothing to dock for -- no port here, or nothing tradeable
+            # -- so no visit actually started to resume the prompt
+            # later. Re-show it now instead of leaving the player stuck.
+            response += _resume_navigation_suffix(pubkey, p["sector_id"])
+        return response
 
     if text in ("y", "yes"):
         next_sector = remaining.pop(0)
@@ -675,7 +877,7 @@ async def cmd_confirm_warp(ctx, message):
         PENDING_WARPS.pop(pubkey, None)
         return f"Navigation cancelled. You remain in Sec{p['sector_id']}."
 
-    return "Reply 'yes' to continue warping or 'no' to cancel."
+    return "Reply 'yes' to continue warping, 'no' to cancel, or 'p' to dock here."
 
 
 def parse(text):
@@ -821,6 +1023,8 @@ async def on_message(mc, event):
 
     if pubkey in PENDING_TRADES:
         response = await cmd_trade_step(ctx, message)
+    elif pubkey in PENDING_UPGRADES:
+        response = await cmd_stardock_step(ctx, message)
     elif pubkey in PENDING_WARPS:
         response = await cmd_confirm_warp(ctx, message)
     else:

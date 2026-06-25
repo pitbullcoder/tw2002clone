@@ -103,6 +103,21 @@ STARTER_SHIP = {
     "shields": 10,
 }
 
+# Per-stat caps on the default ship -- a Stardock refit can never push a
+# stat past these, regardless of how many credits the player has.
+SHIP_MAX_HOLDS = 75
+SHIP_MAX_FIGHTERS = 50
+SHIP_MAX_SHIELDS = 200
+
+# Stardock refit prices, in credits per unit. Keyed by the ships column
+# each upgrade applies to, so callers can go straight from a column name
+# to its price without a separate lookup table.
+STARDOCK_PRICES = {
+    "holds_total": 500,
+    "fighters": 50,
+    "shields": 25,
+}
+
 
 def get_all_warps():
     """
@@ -177,6 +192,34 @@ def execute_trade(player_id, port_id, commodity, qty, total_price, player_is_buy
     conn.execute(
         f"UPDATE ports SET {commodity}_qty = {commodity}_qty + ? WHERE id = ?",
         (port_qty_delta, port_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+_UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields")
+
+
+def upgrade_ship_stat(player_id, stat_column, qty, total_price):
+    """
+    Apply a completed Stardock refit purchase in a single transaction:
+      - player's credits go down by total_price
+      - the ship's `stat_column` (holds_total, fighters, or shields)
+        goes up by qty
+    Caller is responsible for validating quantity/credits/the ship's
+    per-stat cap beforehand -- this function does not re-check anything.
+    """
+    if stat_column not in _UPGRADEABLE_SHIP_STATS:
+        raise ValueError(f"invalid ship stat column: {stat_column}")
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET credits = credits - ? WHERE id = ?",
+        (total_price, player_id)
+    )
+    conn.execute(
+        f"UPDATE ships SET {stat_column} = {stat_column} + ? WHERE player_id = ?",
+        (qty, player_id)
     )
     conn.commit()
     conn.close()
