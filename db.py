@@ -96,22 +96,73 @@ def init_db():
 HOME_SECTOR = 1
 STARTING_CREDITS = 1000
 DAILY_TURNS = 50
-STARTER_SHIP = {
-    "ship_type": "Merchant Cruiser",
-    "holds_total": 20,
-    "fighters": 10,
-    "shields": 10,
+
+DEFAULT_SHIP_TYPE = "Falcon"
+
+# --- Shipyard catalog --------------------------------------------------
+# Every purchasable hull, keyed by name. To add a new ship later, just
+# add another entry here -- nothing else in db.py or main.py needs to
+# change structurally to support it.
+#
+#   classification -- flavor text shown in the shipyard menu.
+#   price          -- credits to buy this hull outright. 0 for the
+#                      Falcon: it's the free starter ship, never an
+#                      actual purchase -- a player only ever lands back
+#                      on it via a sell-back (see sell_value() below).
+#   base_*         -- what a freshly acquired hull starts with.
+#   max_*          -- the per-stat caps a Stardock refit can push that
+#                      hull's holds/fighters/shields up to. Looked up
+#                      per the player's *current* ship_type (see
+#                      upgrade_ship_stat and cmd_stardock_step in
+#                      main.py) rather than a single fixed limit, since
+#                      different hulls cap out at different points.
+SHIP_CATALOG = {
+    "Falcon": {
+        "classification": "Frigate",
+        "price": 0,
+        "base_holds": 20,
+        "base_fighters": 10,
+        "base_shields": 10,
+        "max_holds": 75,
+        "max_fighters": 50,
+        "max_shields": 200,
+    },
+    "SS Endeavour": {
+        "classification": "Merchant Freighter",
+        "price": 20000,
+        "base_holds": 50,
+        "base_fighters": 0,
+        "base_shields": 50,
+        "max_holds": 200,
+        "max_fighters": 10,
+        "max_shields": 400,
+    },
 }
 
-# Per-stat caps on the default ship -- a Stardock refit can never push a
-# stat past these, regardless of how many credits the player has.
-SHIP_MAX_HOLDS = 75
-SHIP_MAX_FIGHTERS = 50
-SHIP_MAX_SHIELDS = 200
+# Fraction of a hull's catalog price refunded when it's traded in at the
+# Stardock shipyard.
+SHIP_RESALE_FRACTION = 0.5
+
+
+def sell_value(ship_type):
+    """Trade-in credit for handing back `ship_type` at the Stardock
+    shipyard -- a flat fraction of its catalog price. Always 0 for the
+    Falcon, since it's priced at 0cr to begin with."""
+    return round(SHIP_CATALOG[ship_type]["price"] * SHIP_RESALE_FRACTION)
+
+
+STARTER_SHIP = {
+    "ship_type": DEFAULT_SHIP_TYPE,
+    "holds_total": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_holds"],
+    "fighters": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_fighters"],
+    "shields": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_shields"],
+}
 
 # Stardock refit prices, in credits per unit. Keyed by the ships column
 # each upgrade applies to, so callers can go straight from a column name
-# to its price without a separate lookup table.
+# to its price without a separate lookup table. Same price regardless of
+# ship type -- only the per-stat *caps* (SHIP_CATALOG[...]["max_*"])
+# vary by hull.
 STARDOCK_PRICES = {
     "holds_total": 500,
     "fighters": 50,
@@ -220,6 +271,37 @@ def upgrade_ship_stat(player_id, stat_column, qty, total_price):
     conn.execute(
         f"UPDATE ships SET {stat_column} = {stat_column} + ? WHERE player_id = ?",
         (qty, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta):
+    """
+    Apply a completed Stardock shipyard transaction in a single
+    transaction -- either buying a different hull, or selling the
+    current one back (the caller just passes the Falcon's base stats
+    and a positive credit_delta for that case):
+      - player's credits change by credit_delta (negative for a net
+        purchase cost, positive for a net refund)
+      - the ship's type and holds_total/fighters/shields are replaced
+        with the new hull's values
+      - any cargo being carried is cleared -- a hull swap empties the
+        hold, since the old ship's cargo doesn't transfer to the new one
+    Caller is responsible for validating affordability beforehand --
+    this function does not re-check anything.
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET credits = credits + ? WHERE id = ?",
+        (credit_delta, player_id)
+    )
+    conn.execute(
+        """UPDATE ships
+           SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?,
+               fuel_ore = 0, organics = 0, equipment = 0
+           WHERE player_id = ?""",
+        (ship_type, holds_total, fighters, shields, player_id)
     )
     conn.commit()
     conn.close()

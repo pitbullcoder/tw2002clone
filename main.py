@@ -18,10 +18,11 @@ from db import (
     move_player_to_sector,
     execute_trade,
     upgrade_ship_stat,
-    SHIP_MAX_HOLDS,
-    SHIP_MAX_FIGHTERS,
-    SHIP_MAX_SHIELDS,
+    buy_ship,
+    SHIP_CATALOG,
+    DEFAULT_SHIP_TYPE,
     STARDOCK_PRICES,
+    sell_value,
 )
 
 print("MeshCore bot started...")
@@ -290,26 +291,71 @@ COMMODITIES = [
 ]
 
 
-# (display label, ships column, price per unit, ship's per-stat cap) for
-# each Stardock refit option, in the fixed order shown in the refit
-# menu. The cap is the same for every player's ship in v1 (there's only
-# one ship type), so it's a plain constant here rather than something
-# pulled per-ship.
+# (display label, ships column, price per unit, SHIP_CATALOG cap key)
+# for each Stardock refit option, in the fixed order shown in the refit
+# menu. The cap key is looked up per the player's *current* ship type
+# (see _ship_stat_limit) rather than baked in here, since different
+# hulls (Falcon, SS Endeavour, ...) cap out at different points.
 STARDOCK_UPGRADES = [
-    ("Cargo Holds", "holds_total", STARDOCK_PRICES["holds_total"], SHIP_MAX_HOLDS),
-    ("Fighters", "fighters", STARDOCK_PRICES["fighters"], SHIP_MAX_FIGHTERS),
-    ("Shields", "shields", STARDOCK_PRICES["shields"], SHIP_MAX_SHIELDS),
+    ("Cargo Holds", "holds_total", STARDOCK_PRICES["holds_total"], "max_holds"),
+    ("Fighters", "fighters", STARDOCK_PRICES["fighters"], "max_fighters"),
+    ("Shields", "shields", STARDOCK_PRICES["shields"], "max_shields"),
 ]
+
+# Menu number for "enter the shipyard" in the top-level Stardock menu --
+# always one past the refit options, so adding/removing a refit stat
+# doesn't require touching this by hand.
+SHIPYARD_OPTION = len(STARDOCK_UPGRADES) + 1
+
+
+def _ship_stat_limit(p, cap_key):
+    """The per-stat cap for the player's *current* ship type -- e.g.
+    _ship_stat_limit(p, "max_holds") for their cargo-hold cap. Always
+    looked up fresh from SHIP_CATALOG rather than a fixed constant,
+    since different hulls cap out at different points."""
+    return SHIP_CATALOG[p["ship_type"]][cap_key]
 
 
 def build_stardock_menu(p):
-    """The Stardock refit menu: current/max and price for each
-    upgradeable stat, shown when a player first docks and again after
-    every purchase (or skip) so they can keep buying in one visit."""
+    """The top-level Stardock menu: current/max and price for each
+    upgradeable stat on the player's current ship, plus an entry into
+    the shipyard. Shown when a player first docks and again after every
+    refit purchase (or skip) so they can keep buying in one visit."""
     lines = ["Stardock refits:"]
-    for i, (label, col, price, limit) in enumerate(STARDOCK_UPGRADES, start=1):
+    for i, (label, col, price, cap_key) in enumerate(STARDOCK_UPGRADES, start=1):
+        limit = _ship_stat_limit(p, cap_key)
         lines.append(f"  {i}) {label} {p[col]}/{limit} @ {price}cr each")
-    lines.append(f"{p['credits']}cr available. Reply with a number to buy, or 'cancel'.")
+    lines.append(f"  {SHIPYARD_OPTION}) Shipyard -- buy or sell your ship")
+    lines.append(f"{p['credits']}cr available. Reply with a number, or 'cancel'.")
+    return "\n".join(lines)
+
+
+def build_shipyard_menu(p):
+    """The shipyard sub-menu: every hull in SHIP_CATALOG with its
+    classification, caps, and price (or 'current ship'/'free'), plus a
+    sell-back option for whatever the player is currently flying (only
+    shown if they're not already flying the free default ship -- there
+    would be nothing to trade in)."""
+    lines = ["Shipyard:"]
+    for i, (name, ship) in enumerate(SHIP_CATALOG.items(), start=1):
+        if name == p["ship_type"]:
+            tag = "(current ship)"
+        elif ship["price"]:
+            tag = f"{ship['price']}cr"
+        else:
+            tag = "free"
+        lines.append(
+            f"  {i}) {name} ({ship['classification']}): "
+            f"{ship['max_holds']} holds / {ship['max_fighters']} fighters / "
+            f"{ship['max_shields']} shields -- {tag}"
+        )
+    if p["ship_type"] != DEFAULT_SHIP_TYPE:
+        resale = sell_value(p["ship_type"])
+        lines.append(
+            f"  S) Sell your {p['ship_type']} -- trade in for {resale}cr "
+            f"and return to the {DEFAULT_SHIP_TYPE}"
+        )
+    lines.append(f"{p['credits']}cr available. Reply with a number to buy, 'S' to sell, or '0' to go back.")
     return "\n".join(lines)
 
 
@@ -646,26 +692,39 @@ async def cmd_trade_step(ctx, message):
 
 async def cmd_stardock_step(ctx, message):
     """
-    Advance a pending Stardock refit visit. Unlike the port trade queue
-    (which walks every tradeable commodity exactly once), the Stardock
-    menu is open-ended: after each completed or skipped purchase the
-    player is shown the menu again and can keep buying -- limited only
-    by their ship's per-stat caps (SHIP_MAX_HOLDS/FIGHTERS/SHIELDS) and
-    their credits -- until they reply 'cancel'.
+    Advance a pending Stardock visit. Unlike the port trade queue (which
+    walks every tradeable commodity exactly once), the Stardock menu is
+    open-ended: after each completed or skipped action the player is
+    shown a menu again and can keep going until they reply 'cancel'.
 
-    Stages, in order:
-      "menu"     -- reply with the menu number of an upgrade to buy, or
-                    'cancel' to leave. Rejects a stat that's already at
-                    its cap, or one the player can't afford even 1 unit
-                    of, before moving to "quantity".
+    Refit stages (buying cargo holds/fighters/shields up to the current
+    ship's caps -- see SHIP_CATALOG/_ship_stat_limit):
+      "menu"     -- reply with a refit's menu number, the shipyard's
+                    menu number (SHIPYARD_OPTION), or 'cancel'. Rejects
+                    a stat that's already at its cap, or one the player
+                    can't afford even 1 unit of, before moving to
+                    "quantity".
       "quantity" -- reply with a whole number of units. 0 returns to the
                     menu without buying. A non-zero amount, capped at
                     state["max_qty"], moves to "confirm" with the listed
                     total price.
       "confirm"  -- "yes" commits the purchase and returns to the menu.
-                    Anything else (e.g. "no") returns to the menu without
-                    buying.
-    'cancel' is accepted at any stage and ends the visit.
+                    Anything else returns to the menu without buying.
+
+    Shipyard stages (buying a different hull, or selling the current one
+    back to the free default ship -- see build_shipyard_menu):
+      "shipyard_menu"    -- reply with a hull's menu number to price out
+                             buying it, 'S'/'sell' to price out selling
+                             the current ship, or '0' to go back to the
+                             main menu. Rejects buying the hull already
+                             owned, or one that can't be afforded even
+                             after the trade-in, before moving to
+                             "shipyard_confirm".
+      "shipyard_confirm" -- "yes" commits the transaction and returns to
+                             the main menu. Anything else returns to the
+                             shipyard menu without buying/selling.
+
+    'cancel' is accepted at any stage and ends the whole visit.
     """
     pubkey = ctx.pubkey
     text = message.strip()
@@ -681,17 +740,23 @@ async def cmd_stardock_step(ctx, message):
         return "Left the Stardock." + _resume_navigation_suffix(pubkey, ctx.player["sector_id"])
 
     # Always re-fetch -- a purchase made a step ago in this same visit
-    # changes both credits and the stat just bought.
+    # changes credits and/or the ship itself.
     p = get_player_with_ship(pubkey)
 
     if state["stage"] == "menu":
         if not re.match(r"^\d+$", text):
-            return "Reply with a number to buy, or 'cancel'.\n\n" + build_stardock_menu(p)
+            return "Reply with a number, or 'cancel'.\n\n" + build_stardock_menu(p)
         choice = int(text)
+
+        if choice == SHIPYARD_OPTION:
+            state["stage"] = "shipyard_menu"
+            return build_shipyard_menu(p)
+
         if choice < 1 or choice > len(STARDOCK_UPGRADES):
             return "Not a valid option.\n\n" + build_stardock_menu(p)
 
-        label, col, price, limit = STARDOCK_UPGRADES[choice - 1]
+        label, col, price, cap_key = STARDOCK_UPGRADES[choice - 1]
+        limit = _ship_stat_limit(p, cap_key)
         current = p[col]
         room = limit - current
         if room <= 0:
@@ -758,6 +823,87 @@ async def cmd_stardock_step(ctx, message):
             f"Installed {qty} {label} for -{total_price}cr.\n\n"
             f"{build_stardock_menu(p)}"
         )
+
+    if state["stage"] == "shipyard_menu":
+        if text == "0":
+            state["stage"] = "menu"
+            return build_stardock_menu(p)
+
+        if lower in ("s", "sell"):
+            if p["ship_type"] == DEFAULT_SHIP_TYPE:
+                return (
+                    f"You're already flying the {DEFAULT_SHIP_TYPE} -- nothing to trade in.\n\n"
+                    + build_shipyard_menu(p)
+                )
+            resale = sell_value(p["ship_type"])
+            state.update({"stage": "shipyard_confirm", "action": "sell", "resale": resale})
+            return (
+                f"Sell your {p['ship_type']} and return to the {DEFAULT_SHIP_TYPE} "
+                f"for {resale}cr? yes/no"
+            )
+
+        if not re.match(r"^\d+$", text):
+            return "Reply with a number to buy, 'S' to sell, or '0' to go back.\n\n" + build_shipyard_menu(p)
+        choice = int(text)
+        catalog_names = list(SHIP_CATALOG)
+        if choice < 1 or choice > len(catalog_names):
+            return "Not a valid option.\n\n" + build_shipyard_menu(p)
+
+        ship_name = catalog_names[choice - 1]
+        if ship_name == p["ship_type"]:
+            return f"You already own the {ship_name}.\n\n" + build_shipyard_menu(p)
+
+        ship = SHIP_CATALOG[ship_name]
+        trade_in = sell_value(p["ship_type"])
+        net_cost = ship["price"] - trade_in
+        if net_cost > p["credits"]:
+            return (
+                f"Can't afford the {ship_name} -- net cost {net_cost}cr "
+                f"({ship['price']}cr less a {trade_in}cr trade-in), you have {p['credits']}cr.\n\n"
+                + build_shipyard_menu(p)
+            )
+
+        state.update({
+            "stage": "shipyard_confirm",
+            "action": "buy",
+            "ship_name": ship_name,
+            "trade_in": trade_in,
+            "net_cost": net_cost,
+        })
+        return (
+            f"Trade in your {p['ship_type']} ({trade_in}cr) for a {ship_name} "
+            f"({ship['price']}cr)? Net cost: {net_cost}cr. yes/no"
+        )
+
+    if state["stage"] == "shipyard_confirm":
+        if lower not in ("y", "yes"):
+            state["stage"] = "shipyard_menu"
+            return build_shipyard_menu(p)
+
+        if state["action"] == "sell":
+            new_ship = SHIP_CATALOG[DEFAULT_SHIP_TYPE]
+            buy_ship(
+                p["id"], DEFAULT_SHIP_TYPE,
+                new_ship["base_holds"], new_ship["base_fighters"], new_ship["base_shields"],
+                credit_delta=state["resale"],
+            )
+            result_line = (
+                f"Sold your old ship. Welcome back to the {DEFAULT_SHIP_TYPE}. "
+                f"+{state['resale']}cr."
+            )
+        else:
+            ship_name = state["ship_name"]
+            ship = SHIP_CATALOG[ship_name]
+            buy_ship(
+                p["id"], ship_name,
+                ship["base_holds"], ship["base_fighters"], ship["base_shields"],
+                credit_delta=-state["net_cost"],
+            )
+            result_line = f"Welcome aboard the {ship_name}! -{state['net_cost']}cr (net)."
+
+        p = get_player_with_ship(pubkey)
+        state["stage"] = "menu"
+        return f"{result_line}\n\n{build_stardock_menu(p)}"
 
     # Shouldn't be reachable, but don't leave a broken visit stuck in state.
     PENDING_UPGRADES.pop(pubkey, None)

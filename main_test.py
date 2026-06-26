@@ -47,6 +47,7 @@ STATE = {
     "port": {},
     "trade_log": [],
     "upgrade_log": [],
+    "ship_log": [],
     # Per-sector fixtures for the navigation/docking tests below. Left
     # empty by the port-trade and Stardock tests above, which only ever
     # care about one port (whichever sector the player is currently
@@ -117,6 +118,52 @@ def _stub_upgrade_ship_stat(player_id, stat_column, qty, total_price):
     player["credits"] -= total_price
 
 
+# Mirrors db.SHIP_CATALOG -- kept as a separate copy here (rather than
+# importing the real db module) since this whole file exists to test
+# main.py without a real db module loaded at all.
+SHIP_CATALOG = {
+    "Falcon": {
+        "classification": "Frigate",
+        "price": 0,
+        "base_holds": 20,
+        "base_fighters": 10,
+        "base_shields": 10,
+        "max_holds": 75,
+        "max_fighters": 50,
+        "max_shields": 200,
+    },
+    "SS Endeavour": {
+        "classification": "Merchant Freighter",
+        "price": 20000,
+        "base_holds": 50,
+        "base_fighters": 0,
+        "base_shields": 50,
+        "max_holds": 200,
+        "max_fighters": 10,
+        "max_shields": 400,
+    },
+}
+DEFAULT_SHIP_TYPE = "Falcon"
+SHIP_RESALE_FRACTION = 0.5
+
+
+def _stub_sell_value(ship_type):
+    return round(SHIP_CATALOG[ship_type]["price"] * SHIP_RESALE_FRACTION)
+
+
+def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta):
+    STATE["ship_log"].append((ship_type, holds_total, fighters, shields, credit_delta))
+    player = STATE["player"]
+    player["ship_type"] = ship_type
+    player["holds_total"] = holds_total
+    player["fighters"] = fighters
+    player["shields"] = shields
+    player["fuel_ore"] = 0
+    player["organics"] = 0
+    player["equipment"] = 0
+    player["credits"] += credit_delta
+
+
 def _install_stub_modules():
     db_stub = types.ModuleType("db")
     db_stub.init_db = lambda: None
@@ -130,9 +177,10 @@ def _install_stub_modules():
     db_stub.move_player_to_sector = _stub_move_player_to_sector
     db_stub.execute_trade = _stub_execute_trade
     db_stub.upgrade_ship_stat = _stub_upgrade_ship_stat
-    db_stub.SHIP_MAX_HOLDS = 75
-    db_stub.SHIP_MAX_FIGHTERS = 50
-    db_stub.SHIP_MAX_SHIELDS = 200
+    db_stub.buy_ship = _stub_buy_ship
+    db_stub.sell_value = _stub_sell_value
+    db_stub.SHIP_CATALOG = SHIP_CATALOG
+    db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
     db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25}
     sys.modules["db"] = db_stub
 
@@ -172,7 +220,7 @@ def fresh_player(**overrides):
         "sector_id": 1,
         "credits": 10000,
         "turns_remaining": 50,
-        "ship_type": "Merchant Cruiser",
+        "ship_type": "Falcon",
         "holds_total": 20,
         "fighters": 0,
         "shields": 0,
@@ -208,6 +256,7 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
             importlib.reload(main)
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
         STATE["ports"] = {}
         STATE["warps"] = {}
 
@@ -361,6 +410,7 @@ class StardockRefitFlowTests(unittest.IsolatedAsyncioTestCase):
             importlib.reload(main)
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
         STATE["ports"] = {}
         STATE["warps"] = {}
 
@@ -522,7 +572,7 @@ class StardockRefitFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Not a valid option.", prompt)
 
         prompt = await self.say("not-a-number")
-        self.assertIn("Reply with a number to buy, or 'cancel'.", prompt)
+        self.assertIn("Reply with a number, or 'cancel'.", prompt)
 
     async def test_multiple_purchases_in_one_visit(self):
         """Buying holds, then fighters, in the same visit -- the menu
@@ -573,6 +623,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
             importlib.reload(main)
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
         STATE["ports"] = {}
         STATE["warps"] = dict(self.WARPS)
 
@@ -725,6 +776,195 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No port in current sector.", prompt)
         self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
+
+
+class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Covers the shipyard sub-menu added to the Stardock visit
+    (cmd_stardock_step's "shipyard_menu"/"shipyard_confirm" stages):
+    buying a different hull (with the current one automatically traded
+    in, since a player can only ever have one ship) or selling the
+    current hull back to the free default Falcon.
+    """
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
+        STATE["ports"] = {}
+        STATE["warps"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def dock(self):
+        return await main.cmd_trade(self.ctx(), "")
+
+    async def say(self, message):
+        return await main.cmd_stardock_step(self.ctx(), message)
+
+    async def enter_shipyard(self):
+        await self.dock()
+        return await self.say("4")  # Shipyard is always one past the refits
+
+    async def test_shipyard_entry_shows_catalog_with_current_ship_tagged(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        prompt = await self.enter_shipyard()
+
+        self.assertIn("Shipyard:", prompt)
+        self.assertIn(
+            "1) Falcon (Frigate): 75 holds / 50 fighters / 200 shields -- (current ship)",
+            prompt,
+        )
+        self.assertIn(
+            "2) SS Endeavour (Merchant Freighter): 200 holds / 10 fighters / 400 shields -- 20000cr",
+            prompt,
+        )
+        # Flying the free default ship -- nothing to trade in, so no sell line.
+        self.assertNotIn("Sell your", prompt)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+
+    async def test_buying_a_new_ship_full_flow(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("2")  # SS Endeavour
+        self.assertIn(
+            "Trade in your Falcon (0cr) for a SS Endeavour (20000cr)? Net cost: 20000cr. yes/no",
+            prompt,
+        )
+
+        prompt = await self.say("yes")
+        self.assertIn("Welcome aboard the SS Endeavour! -20000cr (net).", prompt)
+        self.assertIn("Stardock refits:", prompt)  # back at the top-level menu
+        self.assertIn("Cargo Holds 50/200 @ 500cr each", prompt)  # new ship's caps
+
+        final = STATE["player"]
+        self.assertEqual(final["ship_type"], "SS Endeavour")
+        self.assertEqual(final["holds_total"], 50)
+        self.assertEqual(final["fighters"], 0)
+        self.assertEqual(final["shields"], 50)
+        self.assertEqual(final["credits"], 25000 - 20000)
+        self.assertEqual(STATE["ship_log"], [("SS Endeavour", 50, 0, 50, -20000)])
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")  # visit stays open
+
+    async def test_selling_current_ship_returns_to_falcon(self):
+        STATE["player"] = fresh_player(credits=5000, ship_type="SS Endeavour",
+                                        holds_total=50, fighters=0, shields=50)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("s")
+        self.assertIn(
+            "Sell your SS Endeavour and return to the Falcon for 10000cr? yes/no",
+            prompt,
+        )
+
+        prompt = await self.say("yes")
+        self.assertIn("Sold your old ship. Welcome back to the Falcon. +10000cr.", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["ship_type"], "Falcon")
+        self.assertEqual(final["holds_total"], 20)
+        self.assertEqual(final["fighters"], 10)
+        self.assertEqual(final["shields"], 10)
+        self.assertEqual(final["credits"], 5000 + 10000)
+        self.assertEqual(STATE["ship_log"], [("Falcon", 20, 10, 10, 10000)])
+
+    async def test_ship_swap_clears_cargo(self):
+        """Cargo doesn't transfer between hulls -- swapping (buy or
+        sell) empties whatever was in the hold."""
+        STATE["player"] = fresh_player(
+            credits=25000, ship_type="Falcon",
+            fuel_ore=5, organics=3, equipment=2,
+        )
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        await self.say("2")     # SS Endeavour
+        await self.say("yes")
+
+        final = STATE["player"]
+        self.assertEqual(final["fuel_ore"], 0)
+        self.assertEqual(final["organics"], 0)
+        self.assertEqual(final["equipment"], 0)
+
+    async def test_cannot_sell_while_flying_the_falcon(self):
+        STATE["player"] = fresh_player(credits=5000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("sell")
+
+        self.assertIn("You're already flying the Falcon -- nothing to trade in.", prompt)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+        self.assertEqual(STATE["player"]["ship_type"], "Falcon")  # unchanged
+
+    async def test_cannot_buy_a_ship_already_owned(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="SS Endeavour")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("2")  # SS Endeavour, which they already fly
+
+        self.assertIn("You already own the SS Endeavour.", prompt)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+
+    async def test_cannot_afford_ship_even_after_trade_in(self):
+        STATE["player"] = fresh_player(credits=100, ship_type="Falcon")  # trade-in is 0cr
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("2")  # SS Endeavour @ 20000cr net
+
+        self.assertIn(
+            "Can't afford the SS Endeavour -- net cost 20000cr (20000cr less a 0cr trade-in), "
+            "you have 100cr.",
+            prompt,
+        )
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+        self.assertEqual(STATE["ship_log"], [])
+
+    async def test_declining_purchase_confirm_returns_to_shipyard_menu_unchanged(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        await self.say("2")
+        prompt = await self.say("no")
+
+        self.assertIn("Shipyard:", prompt)
+        self.assertEqual(STATE["player"]["ship_type"], "Falcon")
+        self.assertEqual(STATE["ship_log"], [])
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+
+    async def test_zero_returns_to_the_main_stardock_menu(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("0")
+
+        self.assertIn("Stardock refits:", prompt)
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")
+
+    async def test_cancel_from_shipyard_ends_the_whole_visit(self):
+        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("cancel")
+
+        self.assertEqual(prompt, "Left the Stardock.")
+        self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
 
 
 if __name__ == "__main__":
