@@ -322,26 +322,36 @@ def build_sector_info(sector_id):
     return f"Sec{sector_id}\n{format_port_line(sector_id)}\n{format_warps_line(sector_id)}"
 
 
+def _warp_confirm_options(sector_id):
+    """
+    '(p/yes/no)' if sector_id has a port to dock at, else just
+    '(yes/no)' -- the 'p' option is only worth advertising on a "Warp
+    to: ...?" prompt when there's actually something to dock at right
+    where the player is currently standing.
+    """
+    return "(p/yes/no)" if get_port(sector_id) is not None else "(yes/no)"
+
+
 def _resume_navigation_suffix(pubkey, sector_id):
     """
     If a multi-hop warp confirmation is still pending for pubkey,
     return text re-prompting to continue that route -- formatted the
-    same as the original "Warp to: ...? (yes/no)" prompt, just starting
-    from the player's current sector instead of the one they set out
-    from. Returns "" if there's no route in progress.
+    same as the original "Warp to: ...?" prompt, just starting from the
+    player's current sector instead of the one they set out from.
+    Returns "" if there's no route in progress.
 
     This is what lets a player dock at a port partway through a plotted
     multi-hop course (see cmd_confirm_warp's "p"/"port" handling)
     without losing the rest of the route: cmd_trade_step and
     cmd_stardock_step both call this once their visit ends, appending
     the result to their own closing message so the player is dropped
-    straight back into the yes/no confirmation for the remaining hops.
+    straight back into the warp confirmation for the remaining hops.
     """
     remaining = PENDING_WARPS.get(pubkey)
     if not remaining:
         return ""
     route = " -> ".join(str(s) for s in [sector_id] + remaining)
-    return f"\n\nWarp to: {route}? (yes/no)"
+    return f"\n\nWarp to: {route}? {_warp_confirm_options(sector_id)}"
 
 
 @command("menu", "help", "?", description="list all commands")
@@ -820,7 +830,7 @@ async def cmd_move(ctx, args):
     PENDING_WARPS[ctx.pubkey] = remaining
     hops = len(remaining)
     route = " -> ".join(str(s) for s in path)
-    return f"Plotted a {hops}-warp course to Sec{target}.\nWarp to: {route}? (yes/no)"
+    return f"Plotted a {hops}-warp course to Sec{target}.\nWarp to: {route}? {_warp_confirm_options(p['sector_id'])}"
 
 
 async def cmd_confirm_warp(ctx, message):
@@ -868,7 +878,7 @@ async def cmd_confirm_warp(ctx, message):
             route = " -> ".join(str(s) for s in [next_sector] + remaining)
             return (
                 f"Warped to Sec{next_sector}.\n{build_sector_info(next_sector)}\n"
-                f"Warp to: {route}? (yes/no)"
+                f"Warp to: {route}? {_warp_confirm_options(next_sector)}"
             )
         PENDING_WARPS.pop(pubkey, None)
         return f"Arrived at Sec{next_sector}.\n{build_sector_info(next_sector)}"
@@ -877,7 +887,9 @@ async def cmd_confirm_warp(ctx, message):
         PENDING_WARPS.pop(pubkey, None)
         return f"Navigation cancelled. You remain in Sec{p['sector_id']}."
 
-    return "Reply 'yes' to continue warping, 'no' to cancel, or 'p' to dock here."
+    if get_port(p["sector_id"]) is not None:
+        return "Reply 'yes' to continue warping, 'no' to cancel, or 'p' to dock here."
+    return "Reply 'yes' to continue warping or 'no' to cancel."
 
 
 def parse(text):

@@ -60,11 +60,13 @@ def _stub_get_port(sector_id):
     # Navigation tests populate "ports" per sector_id; everything else
     # uses the single "port" fixture regardless of which sector_id is
     # asked for, since those tests only ever have the player docked in
-    # one place.
+    # one place. Either way, mirror the real get_port's contract of
+    # returning None (not an empty dict) when there's nothing there --
+    # callers like _warp_confirm_options rely on `is not None`.
     if STATE["ports"]:
         port = STATE["ports"].get(sector_id)
         return dict(port) if port is not None else None
-    return dict(STATE["port"])
+    return dict(STATE["port"]) if STATE["port"] else None
 
 
 def _stub_get_adjacent_sectors(sector_id):
@@ -605,7 +607,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Warped to Sec3.", prompt)
         self.assertIn("Port: SSS", prompt)
         self.assertIn("Warps: 1, 4", prompt)
-        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertIn("Warp to: 3 -> 4? (p/yes/no)", prompt)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
         # 3. Instead of yes/no, dock at Sec3's port -- the route to Sec4
@@ -622,7 +624,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         prompt = await main.cmd_trade_step(self.ctx(), "yes")
         self.assertIn("Bought 5 Fuel Ore for -50cr (10cr/unit).", prompt)
         self.assertIn("Nothing more to trade here.", prompt)
-        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertIn("Warp to: 3 -> 4? (p/yes/no)", prompt)
         self.assertNotIn(PUBKEY, main.PENDING_TRADES)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])  # route still open
 
@@ -648,7 +650,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
 
         prompt = await main.cmd_trade_step(self.ctx(), "cancel")
 
-        self.assertEqual(prompt, "Trade cancelled.\n\nWarp to: 3 -> 4? (yes/no)")
+        self.assertEqual(prompt, "Trade cancelled.\n\nWarp to: 3 -> 4? (p/yes/no)")
         self.assertNotIn(PUBKEY, main.PENDING_TRADES)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
@@ -665,7 +667,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         prompt = await main.cmd_confirm_warp(self.ctx(), "port")
 
         self.assertIn("Nothing to trade with this port.", prompt)
-        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertIn("Warp to: 3 -> 4? (p/yes/no)", prompt)
         self.assertNotIn(PUBKEY, main.PENDING_TRADES)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
@@ -693,7 +695,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
         prompt = await main.cmd_stardock_step(self.ctx(), "cancel")
-        self.assertEqual(prompt, "Left the Stardock.\n\nWarp to: 3 -> 4? (yes/no)")
+        self.assertEqual(prompt, "Left the Stardock.\n\nWarp to: 3 -> 4? (p/yes/no)")
         self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
         self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
@@ -701,6 +703,28 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(STATE["player"]["sector_id"], 4)
         self.assertIn("Arrived at Sec4.", prompt)
         self.assertNotIn(PUBKEY, main.PENDING_WARPS)
+
+    async def test_no_port_at_stopover_omits_p_from_the_prompt(self):
+        """The 'p' option should only show up when there's actually a
+        port to dock at -- with none at either Sec1 or Sec3, every
+        prompt along the route stays plain (yes/no)."""
+        STATE["player"] = fresh_player(sector_id=1, credits=10000)
+        STATE["ports"] = {}  # no port anywhere on the route
+
+        prompt = await self.plot_route_to_4()
+        self.assertIn("Warp to: 1 -> 3 -> 4? (yes/no)", prompt)
+        self.assertNotIn("(p/yes/no)", prompt)
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")  # arrive at Sec3
+        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertNotIn("(p/yes/no)", prompt)
+
+        # 'p' is still a no-op here, not a route-breaking error -- it's
+        # just that cmd_trade has nothing to dock at.
+        prompt = await main.cmd_confirm_warp(self.ctx(), "p")
+        self.assertIn("No port in current sector.", prompt)
+        self.assertIn("Warp to: 3 -> 4? (yes/no)", prompt)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [4])
 
 
 if __name__ == "__main__":
