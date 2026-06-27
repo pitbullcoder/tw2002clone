@@ -82,11 +82,36 @@ def init_db():
             holds_total INTEGER NOT NULL,
             fighters INTEGER NOT NULL DEFAULT 0,
             shields INTEGER NOT NULL DEFAULT 0,
+            mines INTEGER NOT NULL DEFAULT 0,
             fuel_ore INTEGER NOT NULL DEFAULT 0,
             organics INTEGER NOT NULL DEFAULT 0,
             equipment INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Migration for databases created before mines existed -- CREATE
+    # TABLE IF NOT EXISTS above is a no-op against an already-existing
+    # ships table, so this adds the column on its own for anyone running
+    # against an older meshcore_messages.db.
+    try:
+        conn.execute("ALTER TABLE ships ADD COLUMN mines INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
+    # Mines a player has *deployed* into a sector (distinct from the
+    # ships.mines column, which is the unlaid count carried aboard). One
+    # row per (sector, owner); qty accumulates as the same player lays
+    # more in the same spot. A player's own mines never detonate on them,
+    # which is why ownership is tracked per row rather than as a single
+    # per-sector count -- see clear_hostile_mines / get_hostile_mine_total.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_mines (
+            sector_id INTEGER NOT NULL REFERENCES sectors(id),
+            player_id INTEGER NOT NULL REFERENCES players(id),
+            qty INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (sector_id, player_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sector_mines_sector ON sector_mines(sector_id)")
 
     conn.commit()
     conn.close()
@@ -98,6 +123,11 @@ STARTING_CREDITS = 1000
 DAILY_TURNS = 50
 
 DEFAULT_SHIP_TYPE = "Falcon"
+
+# The hull a destroyed player is dropped into. Looked up in SHIP_CATALOG
+# like any other, but flagged "purchasable": False there so it never
+# appears in the shipyard.
+ESCAPE_POD_SHIP = "Escape Pod"
 
 # --- Shipyard catalog --------------------------------------------------
 # Every purchasable hull, keyed by name. To add a new ship later, just
@@ -111,11 +141,15 @@ DEFAULT_SHIP_TYPE = "Falcon"
 #                      on it via a sell-back (see sell_value() below).
 #   base_*         -- what a freshly acquired hull starts with.
 #   max_*          -- the per-stat caps a Stardock refit can push that
-#                      hull's holds/fighters/shields up to. Looked up
-#                      per the player's *current* ship_type (see
+#                      hull's holds/fighters/shields/mines up to. Looked
+#                      up per the player's *current* ship_type (see
 #                      upgrade_ship_stat and cmd_stardock_step in
 #                      main.py) rather than a single fixed limit, since
 #                      different hulls cap out at different points.
+#                      max_mines is 0 for any hull without a mine bay --
+#                      main.py's refit menu hides the Mines option
+#                      entirely for those ships rather than showing a
+#                      0/0 line.
 SHIP_CATALOG = {
     "Falcon": {
         "classification": "Frigate",
@@ -123,9 +157,11 @@ SHIP_CATALOG = {
         "base_holds": 20,
         "base_fighters": 10,
         "base_shields": 10,
+        "base_mines": 0,
         "max_holds": 75,
         "max_fighters": 50,
         "max_shields": 200,
+        "max_mines": 0,
     },
     "SS Endeavour": {
         "classification": "Merchant Freighter",
@@ -133,9 +169,45 @@ SHIP_CATALOG = {
         "base_holds": 50,
         "base_fighters": 0,
         "base_shields": 50,
+        "base_mines": 0,
         "max_holds": 200,
         "max_fighters": 10,
         "max_shields": 400,
+        "max_mines": 0,
+    },
+    "Bismark": {
+        "classification": "Capital Ship",
+        "price": 1,
+        "base_holds": 30,
+        "base_fighters": 200,
+        "base_shields": 500,
+        "base_mines": 0,
+        "max_holds": 125,
+        "max_fighters": 2000,
+        "max_shields": 3500,
+        "max_mines": 50,
+    },
+    # Not a hull anyone buys -- it's where a destroyed pilot ends up. A
+    # mine field punches through a ship and the player is ejected into one
+    # of these (see eject-to-pod handling in main.py): no holds, no
+    # fighters, no shields, no mine bay, nothing. "purchasable": False
+    # keeps it out of the Stardock shipyard menu (main.py filters on it)
+    # so it can live in the catalog -- as the destruction code needs --
+    # without ever showing up as something to buy. A pilot flying one can
+    # still trade it back in for the free Falcon at a Stardock, which is
+    # the intended way to climb back out of the pod.
+    "Escape Pod": {
+        "classification": "Escape Pod",
+        "price": 0,
+        "base_holds": 0,
+        "base_fighters": 0,
+        "base_shields": 0,
+        "base_mines": 0,
+        "max_holds": 0,
+        "max_fighters": 0,
+        "max_shields": 0,
+        "max_mines": 0,
+        "purchasable": False,
     },
 }
 
@@ -156,6 +228,7 @@ STARTER_SHIP = {
     "holds_total": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_holds"],
     "fighters": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_fighters"],
     "shields": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_shields"],
+    "mines": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_mines"],
 }
 
 # Stardock refit prices, in credits per unit. Keyed by the ships column
@@ -167,6 +240,7 @@ STARDOCK_PRICES = {
     "holds_total": 500,
     "fighters": 50,
     "shields": 25,
+    "mines": 1,
 }
 
 
@@ -248,7 +322,7 @@ def execute_trade(player_id, port_id, commodity, qty, total_price, player_is_buy
     conn.close()
 
 
-_UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields")
+_UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields", "mines")
 
 
 def upgrade_ship_stat(player_id, stat_column, qty, total_price):
@@ -276,7 +350,7 @@ def upgrade_ship_stat(player_id, stat_column, qty, total_price):
     conn.close()
 
 
-def buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta):
+def buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit_delta):
     """
     Apply a completed Stardock shipyard transaction in a single
     transaction -- either buying a different hull, or selling the
@@ -284,8 +358,8 @@ def buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta)
     and a positive credit_delta for that case):
       - player's credits change by credit_delta (negative for a net
         purchase cost, positive for a net refund)
-      - the ship's type and holds_total/fighters/shields are replaced
-        with the new hull's values
+      - the ship's type and holds_total/fighters/shields/mines are
+        replaced with the new hull's values
       - any cargo being carried is cleared -- a hull swap empties the
         hold, since the old ship's cargo doesn't transfer to the new one
     Caller is responsible for validating affordability beforehand --
@@ -298,10 +372,10 @@ def buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta)
     )
     conn.execute(
         """UPDATE ships
-           SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?,
+           SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?, mines = ?,
                fuel_ore = 0, organics = 0, equipment = 0
            WHERE player_id = ?""",
-        (ship_type, holds_total, fighters, shields, player_id)
+        (ship_type, holds_total, fighters, shields, mines, player_id)
     )
     conn.commit()
     conn.close()
@@ -318,13 +392,82 @@ def move_player_to_sector(player_id, sector_id):
     conn.close()
 
 
+def lay_mines(player_id, sector_id, qty):
+    """
+    Deploy `qty` of a player's carried mines into `sector_id`, in one
+    transaction:
+      - the ship's `mines` count (unlaid, aboard) drops by qty
+      - the sector_mines row for (sector_id, player_id) goes up by qty,
+        created if this is the player's first mine in that sector
+    Caller validates qty (> 0, <= mines aboard) and the sector rule
+    (not a mine-free sector) beforehand -- this does not re-check.
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET mines = mines - ? WHERE player_id = ?",
+        (qty, player_id)
+    )
+    conn.execute(
+        """INSERT INTO sector_mines (sector_id, player_id, qty)
+           VALUES (?, ?, ?)
+           ON CONFLICT(sector_id, player_id) DO UPDATE SET qty = qty + excluded.qty""",
+        (sector_id, player_id, qty)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_hostile_mine_total(sector_id, player_id):
+    """Total mines in `sector_id` deployed by players OTHER than
+    `player_id` -- i.e. how many would detonate if `player_id` entered.
+    A player's own mines are excluded, since they never detonate on
+    their owner. 0 if the sector is clear (for that player)."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT COALESCE(SUM(qty), 0) AS total
+           FROM sector_mines
+           WHERE sector_id = ? AND player_id != ?""",
+        (sector_id, player_id)
+    ).fetchone()
+    conn.close()
+    return row["total"]
+
+
+def clear_hostile_mines(sector_id, player_id):
+    """Remove every mine in `sector_id` NOT owned by `player_id` -- the
+    detonated ones are spent and gone. The entering player's own mines
+    (if any) are left in place. Pairs with get_hostile_mine_total: read
+    the count, then clear, when resolving an entry."""
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM sector_mines WHERE sector_id = ? AND player_id != ?",
+        (sector_id, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_ship_defenses(player_id, shields, fighters):
+    """Set a ship's shields and fighters to absolute values -- used to
+    write back what's left after a mine hit the player survived. (A hit
+    they don't survive goes through buy_ship instead, swapping the whole
+    hull for an Escape Pod.)"""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET shields = ?, fighters = ? WHERE player_id = ?",
+        (shields, fighters, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_player_with_ship(pubkey_prefix):
     """Fetch a player joined with their ship, as a dict. None if no such player."""
     conn = get_connection()
     row = conn.execute("""
         SELECT players.*,
                ships.id AS ship_id, ships.ship_type, ships.holds_total,
-               ships.fighters, ships.shields,
+               ships.fighters, ships.shields, ships.mines,
                ships.fuel_ore, ships.organics, ships.equipment
         FROM players
         JOIN ships ON ships.player_id = players.id
@@ -347,10 +490,10 @@ def create_player(pubkey_prefix, name):
     player_id = cur.lastrowid
 
     conn.execute(
-        """INSERT INTO ships (player_id, ship_type, holds_total, fighters, shields, fuel_ore, organics, equipment)
-           VALUES (?, ?, ?, ?, ?, 0, 0, 0)""",
+        """INSERT INTO ships (player_id, ship_type, holds_total, fighters, shields, mines, fuel_ore, organics, equipment)
+           VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)""",
         (player_id, STARTER_SHIP["ship_type"], STARTER_SHIP["holds_total"],
-         STARTER_SHIP["fighters"], STARTER_SHIP["shields"])
+         STARTER_SHIP["fighters"], STARTER_SHIP["shields"], STARTER_SHIP["mines"])
     )
 
     conn.commit()

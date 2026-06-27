@@ -54,6 +54,12 @@ STATE = {
     # standing in) and don't exercise movement at all.
     "ports": {},
     "warps": {},
+    # Mine fixtures: sector_id -> {owner_player_id: qty deployed there}.
+    # mine_log/defense_log record calls the way trade_log/ship_log do, so
+    # tests can assert on what the lay/detonation paths did.
+    "sector_mines": {},
+    "mine_log": [],
+    "defense_log": [],
 }
 
 
@@ -118,6 +124,35 @@ def _stub_upgrade_ship_stat(player_id, stat_column, qty, total_price):
     player["credits"] -= total_price
 
 
+def _stub_lay_mines(player_id, sector_id, qty):
+    STATE["mine_log"].append((sector_id, player_id, qty))
+    # Only decrement the aboard count if this is the active player (it
+    # always is for the lay-command tests, which is the only path that
+    # calls this).
+    if STATE["player"].get("id") == player_id:
+        STATE["player"]["mines"] -= qty
+    sec = STATE["sector_mines"].setdefault(sector_id, {})
+    sec[player_id] = sec.get(player_id, 0) + qty
+
+
+def _stub_get_hostile_mine_total(sector_id, player_id):
+    sec = STATE["sector_mines"].get(sector_id, {})
+    return sum(q for owner, q in sec.items() if owner != player_id)
+
+
+def _stub_clear_hostile_mines(sector_id, player_id):
+    sec = STATE["sector_mines"].get(sector_id, {})
+    for owner in list(sec):
+        if owner != player_id:
+            del sec[owner]
+
+
+def _stub_set_ship_defenses(player_id, shields, fighters):
+    STATE["defense_log"].append((player_id, shields, fighters))
+    STATE["player"]["shields"] = shields
+    STATE["player"]["fighters"] = fighters
+
+
 # Mirrors db.SHIP_CATALOG -- kept as a separate copy here (rather than
 # importing the real db module) since this whole file exists to test
 # main.py without a real db module loaded at all.
@@ -128,9 +163,11 @@ SHIP_CATALOG = {
         "base_holds": 20,
         "base_fighters": 10,
         "base_shields": 10,
+        "base_mines": 0,
         "max_holds": 75,
         "max_fighters": 50,
         "max_shields": 200,
+        "max_mines": 0,
     },
     "SS Endeavour": {
         "classification": "Merchant Freighter",
@@ -138,12 +175,40 @@ SHIP_CATALOG = {
         "base_holds": 50,
         "base_fighters": 0,
         "base_shields": 50,
+        "base_mines": 0,
         "max_holds": 200,
         "max_fighters": 10,
         "max_shields": 400,
+        "max_mines": 0,
+    },
+    "Bismark": {
+        "classification": "Capital Ship",
+        "price": 23500,
+        "base_holds": 30,
+        "base_fighters": 200,
+        "base_shields": 500,
+        "base_mines": 0,
+        "max_holds": 125,
+        "max_fighters": 2000,
+        "max_shields": 3500,
+        "max_mines": 50,
+    },
+    "Escape Pod": {
+        "classification": "Escape Pod",
+        "price": 0,
+        "base_holds": 0,
+        "base_fighters": 0,
+        "base_shields": 0,
+        "base_mines": 0,
+        "max_holds": 0,
+        "max_fighters": 0,
+        "max_shields": 0,
+        "max_mines": 0,
+        "purchasable": False,
     },
 }
 DEFAULT_SHIP_TYPE = "Falcon"
+ESCAPE_POD_SHIP = "Escape Pod"
 SHIP_RESALE_FRACTION = 0.5
 
 
@@ -151,13 +216,14 @@ def _stub_sell_value(ship_type):
     return round(SHIP_CATALOG[ship_type]["price"] * SHIP_RESALE_FRACTION)
 
 
-def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, credit_delta):
-    STATE["ship_log"].append((ship_type, holds_total, fighters, shields, credit_delta))
+def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit_delta):
+    STATE["ship_log"].append((ship_type, holds_total, fighters, shields, mines, credit_delta))
     player = STATE["player"]
     player["ship_type"] = ship_type
     player["holds_total"] = holds_total
     player["fighters"] = fighters
     player["shields"] = shields
+    player["mines"] = mines
     player["fuel_ore"] = 0
     player["organics"] = 0
     player["equipment"] = 0
@@ -178,10 +244,15 @@ def _install_stub_modules():
     db_stub.execute_trade = _stub_execute_trade
     db_stub.upgrade_ship_stat = _stub_upgrade_ship_stat
     db_stub.buy_ship = _stub_buy_ship
+    db_stub.lay_mines = _stub_lay_mines
+    db_stub.get_hostile_mine_total = _stub_get_hostile_mine_total
+    db_stub.clear_hostile_mines = _stub_clear_hostile_mines
+    db_stub.set_ship_defenses = _stub_set_ship_defenses
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
-    db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25}
+    db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
+    db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000}
     sys.modules["db"] = db_stub
 
     meshcore_stub = types.ModuleType("meshcore")
@@ -224,6 +295,7 @@ def fresh_player(**overrides):
         "holds_total": 20,
         "fighters": 0,
         "shields": 0,
+        "mines": 0,
         "fuel_ore": 0,
         "organics": 0,
         "equipment": 0,
@@ -257,6 +329,7 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
+        STATE["port"] = {}
         STATE["ports"] = {}
         STATE["warps"] = {}
 
@@ -411,6 +484,7 @@ class StardockRefitFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
+        STATE["port"] = {}
         STATE["ports"] = {}
         STATE["warps"] = {}
 
@@ -624,6 +698,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
+        STATE["port"] = {}
         STATE["ports"] = {}
         STATE["warps"] = dict(self.WARPS)
 
@@ -796,6 +871,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
+        STATE["port"] = {}
         STATE["ports"] = {}
         STATE["warps"] = {}
 
@@ -827,9 +903,45 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
             "2) SS Endeavour (Merchant Freighter): 200 holds / 10 fighters / 400 shields -- 20000cr",
             prompt,
         )
+        # Bismark has a mine bay -- its line should include mine
+        # capacity, unlike the other two hulls which have none.
+        self.assertIn(
+            "3) Bismark (Capital Ship): 125 holds / 2000 fighters / 3500 shields / 50 mines -- 23500cr",
+            prompt,
+        )
         # Flying the free default ship -- nothing to trade in, so no sell line.
         self.assertNotIn("Sell your", prompt)
         self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+
+    async def test_buying_the_bismark_full_flow(self):
+        STATE["player"] = fresh_player(credits=30000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("3")  # Bismark
+        self.assertIn(
+            "Trade in your Falcon (0cr) for a Bismark (23500cr)? Net cost: 23500cr. yes/no",
+            prompt,
+        )
+
+        prompt = await self.say("yes")
+        self.assertIn("Welcome aboard the Bismark! -23500cr (net).", prompt)
+        # Back at the top-level menu, now with a Mines refit option that
+        # wasn't there for the Falcon, and Shipyard bumped to #5.
+        self.assertIn("Cargo Holds 30/125 @ 500cr each", prompt)
+        self.assertIn("Fighters 200/2000 @ 50cr each", prompt)
+        self.assertIn("Shields 500/3500 @ 25cr each", prompt)
+        self.assertIn("Mines 0/50 @ 1000cr each", prompt)
+        self.assertIn("5) Shipyard", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["ship_type"], "Bismark")
+        self.assertEqual(final["holds_total"], 30)
+        self.assertEqual(final["fighters"], 200)
+        self.assertEqual(final["shields"], 500)
+        self.assertEqual(final["mines"], 0)
+        self.assertEqual(final["credits"], 30000 - 23500)
+        self.assertEqual(STATE["ship_log"], [("Bismark", 30, 200, 500, 0, -23500)])
 
     async def test_buying_a_new_ship_full_flow(self):
         STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
@@ -853,7 +965,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["fighters"], 0)
         self.assertEqual(final["shields"], 50)
         self.assertEqual(final["credits"], 25000 - 20000)
-        self.assertEqual(STATE["ship_log"], [("SS Endeavour", 50, 0, 50, -20000)])
+        self.assertEqual(STATE["ship_log"], [("SS Endeavour", 50, 0, 50, 0, -20000)])
         self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")  # visit stays open
 
     async def test_selling_current_ship_returns_to_falcon(self):
@@ -877,7 +989,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["fighters"], 10)
         self.assertEqual(final["shields"], 10)
         self.assertEqual(final["credits"], 5000 + 10000)
-        self.assertEqual(STATE["ship_log"], [("Falcon", 20, 10, 10, 10000)])
+        self.assertEqual(STATE["ship_log"], [("Falcon", 20, 10, 10, 0, 10000)])
 
     async def test_ship_swap_clears_cargo(self):
         """Cargo doesn't transfer between hulls -- swapping (buy or
@@ -965,6 +1077,368 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prompt, "Left the Stardock.")
         self.assertNotIn(PUBKEY, main.PENDING_UPGRADES)
+
+
+class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
+    """
+    Covers the Mines refit stat and its per-ship visibility: only a hull
+    with a mine bay (max_mines > 0, i.e. the Bismark) offers it in the
+    Stardock menu. Falcon/SS Endeavour have none, so the menu -- and the
+    Shipyard option's numbering -- should never mention it for them.
+    """
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
+        STATE["port"] = {}
+        STATE["ports"] = {}
+        STATE["warps"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def dock(self):
+        return await main.cmd_trade(self.ctx(), "")
+
+    async def say(self, message):
+        return await main.cmd_stardock_step(self.ctx(), message)
+
+    async def test_mines_hidden_for_ships_without_a_mine_bay(self):
+        STATE["player"] = fresh_player(credits=5000, ship_type="Falcon")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        prompt = await self.dock()
+
+        self.assertNotIn("Mines", prompt)
+        self.assertIn("3) Shields", prompt)
+        self.assertIn("4) Shipyard", prompt)  # right after the 3 refits, no gap for Mines
+
+    async def test_mines_appears_for_the_bismark_and_shifts_shipyard(self):
+        STATE["player"] = fresh_player(credits=5000, ship_type="Bismark",
+                                        holds_total=30, fighters=200, shields=500, mines=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        prompt = await self.dock()
+
+        self.assertIn("4) Mines 0/50 @ 1000cr each", prompt)
+        self.assertIn("5) Shipyard", prompt)
+
+    async def test_buy_mines_full_flow(self):
+        STATE["player"] = fresh_player(credits=10000, ship_type="Bismark",
+                                        holds_total=30, fighters=200, shields=500, mines=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("4")  # Mines
+        self.assertIn("Mines: 0/50, 1000cr each.", prompt)
+        self.assertIn("Buy how many? (0-10, or 'cancel')", prompt)  # 10000cr / 1000cr each
+
+        prompt = await self.say("5")
+        self.assertIn("Buy 5 Mines for 5000cr (1000cr/unit)? yes/no", prompt)
+
+        prompt = await self.say("yes")
+        self.assertIn("Installed 5 Mines for -5000cr.", prompt)
+        self.assertIn("Mines 5/50 @ 1000cr each", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["mines"], 5)
+        self.assertEqual(final["credits"], 10000 - 5000)
+        self.assertEqual(STATE["upgrade_log"], [("mines", 5, 5000)])
+
+    async def test_mines_capped_at_ship_max(self):
+        STATE["player"] = fresh_player(credits=1000000, ship_type="Bismark",
+                                        holds_total=30, fighters=200, shields=500, mines=48)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("4")  # Mines: only 2 units of room left under the 50 cap
+
+        self.assertIn("Buy how many? (0-2, or 'cancel')", prompt)
+
+    async def test_mines_already_at_cap_is_rejected(self):
+        STATE["player"] = fresh_player(credits=1000000, ship_type="Bismark",
+                                        holds_total=30, fighters=200, shields=500, mines=50)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("4")  # Mines, already at the 50 cap
+
+        self.assertIn("Already at max Mines (50).", prompt)
+
+
+class FakeRandom:
+    """Deterministic stand-in for the `random` module that main uses.
+    `randints` is a queue popped by randint() (falling back to the high
+    end once exhausted); choice() returns the element at `choice_index`.
+    Install per-test with `main.random = FakeRandom(...)` after setUp's
+    reload has restored the real module."""
+
+    def __init__(self, randints=None, choice_index=0):
+        self.randints = list(randints or [])
+        self.choice_index = choice_index
+
+    def randint(self, a, b):
+        return self.randints.pop(0) if self.randints else b
+
+    def choice(self, seq):
+        seq = list(seq)
+        return seq[self.choice_index % len(seq)]
+
+
+def chain_warps(n):
+    """A simple line graph 1-2-3-...-n, so hop distance equals the
+    difference in sector numbers -- handy for asserting escape-pod
+    distance ranges precisely."""
+    warps = {}
+    for i in range(1, n + 1):
+        nbrs = []
+        if i > 1:
+            nbrs.append(i - 1)
+        if i < n:
+            nbrs.append(i + 1)
+        warps[i] = nbrs
+    return warps
+
+
+class MineDamageMathTests(unittest.TestCase):
+    """Pure unit tests for apply_mine_damage -- the shields -> fighters ->
+    hull cascade, with no db or async in the way."""
+
+    def test_shields_absorb_one_for_one(self):
+        # 9 damage, 20 shields: shields take it all, fighters untouched.
+        s_after, f_after, s_lost, f_lost, destroyed = main.apply_mine_damage(20, 5, 9)
+        self.assertEqual((s_after, f_after), (11, 5))
+        self.assertEqual((s_lost, f_lost), (9, 0))
+        self.assertFalse(destroyed)
+
+    def test_overflow_spills_into_fighters_at_two_per(self):
+        # 5 shields gone, 5 damage left -> 3 fighters (ceil(5/2)) lost.
+        s_after, f_after, s_lost, f_lost, destroyed = main.apply_mine_damage(5, 10, 10)
+        self.assertEqual(s_after, 0)
+        self.assertEqual(s_lost, 5)
+        self.assertEqual(f_lost, 3)        # ceil(5 / 2)
+        self.assertEqual(f_after, 7)
+        self.assertFalse(destroyed)
+
+    def test_exact_absorption_survives_at_zero_zero(self):
+        # 2 shields + 2 fighters (worth 4) = 6 capacity vs 5 damage: the
+        # ship is stripped to 0/0 but NOT destroyed -- damage ran out
+        # before the defenses did.
+        s_after, f_after, s_lost, f_lost, destroyed = main.apply_mine_damage(2, 2, 5)
+        self.assertEqual((s_after, f_after), (0, 0))
+        self.assertFalse(destroyed)
+
+    def test_destroyed_when_damage_outlasts_both(self):
+        # 2 shields + 1 fighter (worth 2) = 4 capacity vs 5 damage: 1
+        # point punches through with nothing left -> destroyed.
+        s_after, f_after, s_lost, f_lost, destroyed = main.apply_mine_damage(2, 1, 5)
+        self.assertEqual((s_after, f_after), (0, 0))
+        self.assertTrue(destroyed)
+
+    def test_no_defenses_any_damage_destroys(self):
+        _, _, _, _, destroyed = main.apply_mine_damage(0, 0, 1)
+        self.assertTrue(destroyed)
+
+    def test_zero_damage_is_harmless(self):
+        s_after, f_after, _, _, destroyed = main.apply_mine_damage(7, 3, 0)
+        self.assertEqual((s_after, f_after), (7, 3))
+        self.assertFalse(destroyed)
+
+
+class EscapeSectorTests(unittest.TestCase):
+    """choose_escape_sector / sectors_within_hop_range against a known
+    line graph where hop distance is exact."""
+
+    def test_picks_a_sector_in_the_4_to_6_hop_band(self):
+        graph = chain_warps(40)
+        for _ in range(20):
+            dest = main.choose_escape_sector(graph, 20)  # real randomness
+            self.assertIn(dest, {14, 15, 16, 24, 25, 26})
+
+    def test_falls_back_to_farthest_when_band_is_empty(self):
+        # A 3-sector line: from the end, nothing is 4-6 hops out, so it
+        # falls back to the farthest reachable sector.
+        graph = chain_warps(3)
+        self.assertEqual(main.choose_escape_sector(graph, 1), 3)
+
+    def test_returns_none_when_nowhere_to_go(self):
+        self.assertIsNone(main.choose_escape_sector({5: []}, 5))
+
+
+class LayMinesCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["mine_log"] = []
+        STATE["defense_log"] = []
+        STATE["sector_mines"] = {}
+        STATE["warps"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def lay(self, args):
+        return await main.cmd_lay_mines(self.ctx(), args)
+
+    async def test_lay_mines_deploys_and_decrements_aboard(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Bismark", mines=10)
+        prompt = await self.lay("4")
+        self.assertIn("Laid 4 mines in Sec42; 6 still aboard.", prompt)
+        self.assertEqual(STATE["player"]["mines"], 6)
+        self.assertEqual(STATE["mine_log"], [(42, 1, 4)])
+        self.assertEqual(STATE["sector_mines"][42], {1: 4})
+
+    async def test_laying_again_accumulates_in_the_same_sector(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Bismark", mines=10)
+        await self.lay("4")
+        STATE["player"]["mines"] = 6  # mirror the decrement for the 2nd ctx
+        await self.lay("2")
+        self.assertEqual(STATE["sector_mines"][42], {1: 6})
+
+    async def test_safe_zone_sectors_reject_laying(self):
+        STATE["player"] = fresh_player(sector_id=10, ship_type="Bismark", mines=10)
+        prompt = await self.lay("1")
+        self.assertIn("safe zone", prompt)
+        self.assertEqual(STATE["mine_log"], [])         # nothing deployed
+        self.assertEqual(STATE["player"]["mines"], 10)  # nothing spent
+
+    async def test_first_sector_outside_safe_zone_is_allowed(self):
+        STATE["player"] = fresh_player(sector_id=11, ship_type="Bismark", mines=5)
+        prompt = await self.lay("1")
+        self.assertIn("Laid 1 mine in Sec11", prompt)
+
+    async def test_no_mines_aboard_is_rejected(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Falcon", mines=0)
+        prompt = await self.lay("3")
+        self.assertIn("No mines aboard", prompt)
+        self.assertEqual(STATE["mine_log"], [])
+
+    async def test_missing_count_prompts_for_one(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Bismark", mines=5)
+        prompt = await self.lay("")
+        self.assertIn("Lay how many mines?", prompt)
+        self.assertEqual(STATE["mine_log"], [])
+
+    async def test_more_than_aboard_is_rejected(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Bismark", mines=3)
+        prompt = await self.lay("4")
+        self.assertIn("only have 3 mines aboard", prompt)
+        self.assertEqual(STATE["mine_log"], [])
+
+    async def test_non_numeric_and_zero_are_rejected(self):
+        STATE["player"] = fresh_player(sector_id=42, ship_type="Bismark", mines=5)
+        self.assertIn("whole number", await self.lay("lots"))
+        self.assertIn("from 1 up", await self.lay("0"))
+        self.assertEqual(STATE["mine_log"], [])
+
+
+class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
+    """Entering a sector that holds someone else's mines: damage, survival,
+    own-mine safety, and the destruction -> escape-pod path."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["ship_log"] = []
+        STATE["mine_log"] = []
+        STATE["defense_log"] = []
+        STATE["sector_mines"] = {}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["warps"] = chain_warps(30)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_surviving_a_hit_records_reduced_defenses(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
+                                       shields=20, fighters=10)
+        STATE["sector_mines"] = {13: {2: 2}}   # player 2 laid 2 mines
+        main.random = FakeRandom([5, 4])        # 9 total damage
+
+        prompt = await main.cmd_move(self.ctx(), "13")
+
+        self.assertIn("2 mines detonate for 9 damage", prompt)
+        self.assertIn("Lost 9 shields, 0 fighters", prompt)
+        self.assertIn("now 11 shields, 10 fighters", prompt)
+        self.assertEqual(STATE["defense_log"], [(1, 11, 10)])
+        self.assertEqual(STATE["player"]["sector_id"], 13)
+        self.assertEqual(STATE["sector_mines"].get(13), {})  # detonated, cleared
+
+    async def test_own_mines_do_not_detonate(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
+                                       shields=20, fighters=10)
+        STATE["sector_mines"] = {13: {1: 5}}    # the entering player's own mines
+
+        prompt = await main.cmd_move(self.ctx(), "13")
+
+        self.assertIn("Moved to Sec13.", prompt)
+        self.assertNotIn("detonate", prompt)
+        self.assertEqual(STATE["defense_log"], [])
+        self.assertEqual(STATE["sector_mines"][13], {1: 5})  # left in place
+
+    async def test_destruction_ejects_into_an_escape_pod_far_away(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
+                                       shields=5, fighters=2,
+                                       fuel_ore=10, organics=5, equipment=3)
+        STATE["sector_mines"] = {13: {2: 10}}
+        main.random = FakeRandom([10] * 10)     # 100 damage -- lethal
+
+        prompt = await main.cmd_move(self.ctx(), "13")
+
+        self.assertIn("Bismark is DESTROYED", prompt)
+        self.assertIn("Escape Pod", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["ship_type"], "Escape Pod")
+        self.assertEqual((final["shields"], final["fighters"], final["holds_total"]), (0, 0, 0))
+        self.assertEqual((final["fuel_ore"], final["organics"], final["equipment"]), (0, 0, 0))
+        # Landed somewhere 4-6 hops from the blast (Sec13) on the line graph.
+        landed = final["sector_id"]
+        self.assertIn(landed, set(main.sectors_within_hop_range(STATE["warps"], 13, 4, 6)))
+        self.assertEqual(len(STATE["ship_log"]), 1)
+        self.assertEqual(STATE["ship_log"][0][0], "Escape Pod")
+
+    async def test_death_mid_route_cancels_the_rest_of_the_course(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
+                                       shields=0, fighters=0)
+        STATE["sector_mines"] = {13: {2: 3}}
+        main.random = FakeRandom([10, 10, 10])
+
+        # Plot 12 -> 13 -> 14 -> 15; the first hop lands on the mines.
+        prompt = await main.cmd_move(self.ctx(), "15")
+        self.assertIn("Warp to: 12 -> 13 -> 14 -> 15?", prompt)
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [13, 14, 15])
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
+        self.assertIn("DESTROYED", prompt)
+        self.assertNotIn("Warp to:", prompt)              # route abandoned
+        self.assertNotIn(PUBKEY, main.PENDING_WARPS)
+
+    async def test_escape_pod_is_not_offered_for_sale_in_the_shipyard(self):
+        STATE["player"] = fresh_player(id=1, sector_id=1, ship_type="Escape Pod")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        main.PENDING_UPGRADES[PUBKEY] = {"stage": "shipyard_menu"}
+        prompt = await main.cmd_stardock_step(self.ctx(), "")  # re-show shipyard menu
+
+        self.assertIn("1) Falcon", prompt)
+        self.assertIn("2) SS Endeavour", prompt)
+        self.assertIn("3) Bismark", prompt)
+        self.assertNotIn("4)", prompt)                     # pod not a buy option
+        self.assertIn("Sell your Escape Pod", prompt)      # but can be traded back in
 
 
 if __name__ == "__main__":
