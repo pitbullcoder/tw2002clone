@@ -34,8 +34,13 @@ PENDING_UPGRADES = {}
 COMMANDS = {}
 
 
-def command(name, *aliases, description=""):
+def command(name, *aliases, description="", menu="main"):
     def decorator(func):
+        # `menu` files a command under a help submenu ("main" shows in the
+        # top-level menu; anything else, e.g. "combat", is listed only by
+        # that submenu). Stored on the function so the COMMANDS tuple shape
+        # stays (description, handler) for every existing unpacker.
+        func._menu = menu
         for n in (name, *aliases):
             COMMANDS[n] = (description, func)
         return func

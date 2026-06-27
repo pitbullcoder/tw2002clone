@@ -49,6 +49,7 @@ STARDOCK_UPGRADE_DEFS = [
     ("Fighters", "fighters", STARDOCK_PRICES["fighters"], "max_fighters"),
     ("Shields", "shields", STARDOCK_PRICES["shields"], "max_shields"),
     ("Mines", "mines", STARDOCK_PRICES["mines"], "max_mines"),
+    ("Probes", "probes", STARDOCK_PRICES["probes"], "max_probes"),
 ]
 
 

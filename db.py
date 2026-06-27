@@ -83,6 +83,7 @@ def init_db():
             fighters INTEGER NOT NULL DEFAULT 0,
             shields INTEGER NOT NULL DEFAULT 0,
             mines INTEGER NOT NULL DEFAULT 0,
+            probes INTEGER NOT NULL DEFAULT 0,
             fuel_ore INTEGER NOT NULL DEFAULT 0,
             organics INTEGER NOT NULL DEFAULT 0,
             equipment INTEGER NOT NULL DEFAULT 0
@@ -94,6 +95,13 @@ def init_db():
     # against an older meshcore_messages.db.
     try:
         conn.execute("ALTER TABLE ships ADD COLUMN mines INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
+    # Migration for databases created before probes existed (same reasoning
+    # as the mines column above).
+    try:
+        conn.execute("ALTER TABLE ships ADD COLUMN probes INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # already has the column
 
@@ -162,6 +170,8 @@ SHIP_CATALOG = {
         "max_fighters": 50,
         "max_shields": 200,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 10,
     },
     "SS Endeavour": {
         "classification": "Merchant Freighter",
@@ -174,6 +184,8 @@ SHIP_CATALOG = {
         "max_fighters": 10,
         "max_shields": 400,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 10,
     },
     "Bismark": {
         "classification": "Capital Ship",
@@ -186,6 +198,8 @@ SHIP_CATALOG = {
         "max_fighters": 2000,
         "max_shields": 3500,
         "max_mines": 50,
+        "base_probes": 0,
+        "max_probes": 20,
     },
     # Not a hull anyone buys -- it's where a destroyed pilot ends up. A
     # mine field punches through a ship and the player is ejected into one
@@ -207,6 +221,8 @@ SHIP_CATALOG = {
         "max_fighters": 0,
         "max_shields": 0,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 0,
         "purchasable": False,
     },
 }
@@ -241,6 +257,7 @@ STARDOCK_PRICES = {
     "fighters": 50,
     "shields": 25,
     "mines": 1,
+    "probes": 100,
 }
 
 
@@ -322,7 +339,7 @@ def execute_trade(player_id, port_id, commodity, qty, total_price, player_is_buy
     conn.close()
 
 
-_UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields", "mines")
+_UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields", "mines", "probes")
 
 
 def upgrade_ship_stat(player_id, stat_column, qty, total_price):
@@ -373,7 +390,7 @@ def buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit
     conn.execute(
         """UPDATE ships
            SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?, mines = ?,
-               fuel_ore = 0, organics = 0, equipment = 0
+               probes = 0, fuel_ore = 0, organics = 0, equipment = 0
            WHERE player_id = ?""",
         (ship_type, holds_total, fighters, shields, mines, player_id)
     )
@@ -447,6 +464,47 @@ def clear_hostile_mines(sector_id, player_id):
     conn.close()
 
 
+def consume_probe(player_id):
+    """Spend one probe from a player's ship when they launch it. Caller
+    validates there's at least one aboard beforehand."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET probes = probes - 1 WHERE player_id = ?",
+        (player_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def detonate_one_hostile_mine(sector_id, player_id):
+    """Spend a SINGLE mine in `sector_id` owned by someone other than
+    `player_id`. A probe is so fragile that one mine destroys it, leaving
+    the rest of the field intact -- unlike a ship arrival, which sets off
+    the whole lot via clear_hostile_mines. No-op if there are no hostile
+    mines there."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT player_id, qty FROM sector_mines
+           WHERE sector_id = ? AND player_id != ? AND qty > 0
+           LIMIT 1""",
+        (sector_id, player_id)
+    ).fetchone()
+    if row is not None:
+        owner = row["player_id"]
+        if row["qty"] <= 1:
+            conn.execute(
+                "DELETE FROM sector_mines WHERE sector_id = ? AND player_id = ?",
+                (sector_id, owner)
+            )
+        else:
+            conn.execute(
+                "UPDATE sector_mines SET qty = qty - 1 WHERE sector_id = ? AND player_id = ?",
+                (sector_id, owner)
+            )
+        conn.commit()
+    conn.close()
+
+
 def set_ship_defenses(player_id, shields, fighters):
     """Set a ship's shields and fighters to absolute values -- used to
     write back what's left after a mine hit the player survived. (A hit
@@ -468,6 +526,7 @@ def get_player_with_ship(pubkey_prefix):
         SELECT players.*,
                ships.id AS ship_id, ships.ship_type, ships.holds_total,
                ships.fighters, ships.shields, ships.mines,
+               ships.probes,
                ships.fuel_ore, ships.organics, ships.equipment
         FROM players
         JOIN ships ON ships.player_id = players.id

@@ -15,7 +15,29 @@ def build_menu():
         if handler in seen:
             continue
         seen.add(handler)
+        # Commands filed under a submenu (e.g. combat) aren't listed at the
+        # top level -- they're reached via that submenu's own command.
+        if getattr(handler, "_menu", "main") != "main":
+            continue
         lines.append(f"  {cmd} - {description}")
+    return "\n".join(lines)
+
+
+def build_submenu(menu_name):
+    """List just the commands filed under `menu_name` (e.g. 'combat').
+    Mirrors build_menu's dedupe-by-handler so aliases don't double up.
+    Returns a friendly note if nothing is filed there."""
+    lines = [f"{menu_name.capitalize()} commands:"]
+    seen = set()
+    for cmd, (description, handler) in COMMANDS.items():
+        if handler in seen:
+            continue
+        if getattr(handler, "_menu", "main") != menu_name:
+            continue
+        seen.add(handler)
+        lines.append(f"  {cmd} - {description}")
+    if len(lines) == 1:
+        lines.append(f"  (no {menu_name} commands)")
     return "\n".join(lines)
 
 

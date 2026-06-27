@@ -41,6 +41,8 @@ from db import (
     get_hostile_mine_total,
     clear_hostile_mines,
     set_ship_defenses,
+    consume_probe,
+    detonate_one_hostile_mine,
     SHIP_CATALOG,
     ESCAPE_POD_SHIP,
 )
@@ -65,7 +67,7 @@ from core import (
     _resume_navigation_suffix,
 )
 from messaging import send_reply, send_channel_reply, is_stale_message
-from display import build_menu, build_sector_info, format_port_line, format_warps_line
+from display import build_menu, build_submenu, build_sector_info, format_port_line, format_warps_line
 from pathfinding import find_shortest_path, choose_escape_sector
 # Re-exported so the test suite can reach it as main.sectors_within_hop_range.
 from pathfinding import sectors_within_hop_range  # noqa: F401
@@ -89,10 +91,12 @@ session.ACTIVE_SESSION = None
 # are defined in sibling modules and re-exported here on purpose.
 __all__ = [
     "Ctx",
-    "cmd_menu", "cmd_quit", "cmd_info", "cmd_status", "cmd_lay_mines",
+    "cmd_menu", "cmd_quit", "cmd_info", "cmd_status",
+    "cmd_combat", "cmd_lay_mines", "cmd_probe",
     "cmd_move", "cmd_confirm_warp",
     "cmd_trade", "cmd_trade_step", "cmd_stardock_step",
-    "enter_sector", "apply_mine_damage", "choose_escape_sector",
+    "enter_sector", "run_probe",
+    "apply_mine_damage", "choose_escape_sector",
     "sectors_within_hop_range",
     "PENDING_WARPS", "PENDING_TRADES", "PENDING_UPGRADES",
     "on_message", "on_channel_message", "main",
@@ -122,9 +126,17 @@ MINE_FREE_SECTORS = 10
 _NUMBER_LIKE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
-@command("menu", "help", "?", description="list all commands")
+@command("menu", "help", "?", description="list commands ('help combat' for combat)")
 async def cmd_menu(ctx, args):
+    sub = args.strip().lower()
+    if sub:
+        return build_submenu(sub)
     return build_menu()
+
+
+@command("combat", description="combat & recon commands (lay mines, send probes)")
+async def cmd_combat(ctx, args):
+    return build_submenu("combat")
 
 
 @command("quit", "logout", description="sign off so another player can take a turn")
@@ -144,6 +156,8 @@ async def cmd_status(ctx, args):
     defenses = f"Cargo Holds {p['holds_total']} Fighters {p['fighters']} Shields {p['shields']}"
     if p["mines"] > 0:
         defenses += f" Mines {p['mines']}"
+    if p["probes"] > 0:
+        defenses += f" Probes {p['probes']}"
     return (
         f"Sec{p['sector_id']} {p['credits']}cr {p['turns_remaining']}turn\n"
         f"{p['ship_type']}\n"
@@ -154,7 +168,7 @@ async def cmd_status(ctx, args):
     )
 
 
-@command("lay", "mine", description="lay mines in this sector: 'lay <n>'")
+@command("lay", "mine", description="lay mines in this sector: 'lay <n>'", menu="combat")
 async def cmd_lay_mines(ctx, args):
     """
     Deploy mines from the ship into the current sector, where they wait
@@ -195,6 +209,68 @@ async def cmd_lay_mines(ctx, args):
         f"Laid {_plural(qty, 'mine')} in Sec{sector_id}; {left} still aboard. "
         "They'll detonate on the next pilot through who isn't you."
     )
+
+
+@command("probe", description="send a recon probe to a sector: 'probe <n>'", menu="combat")
+async def cmd_probe(ctx, args):
+    """
+    Launch a recon probe toward a target sector. The probe follows the
+    same shortest-path route a piloted warp would (see cmd_move), but the
+    player stays put -- it's remote scouting. It reports each sector it
+    passes through, just as the player would see on arrival, and is
+    consumed on launch whether or not it makes it.
+
+    A probe is fragile: a single hostile mine in any sector it enters
+    destroys it on the spot (that one mine is spent; the rest of the
+    field stays put for real ships). Probes are bought at a Stardock.
+    """
+    p = ctx.player
+
+    if p["probes"] <= 0:
+        return "No probes aboard. Buy some at a Stardock (100cr each)."
+
+    arg = args.strip()
+    if not arg:
+        return f"Send a probe where? You have {p['probes']}. Try 'probe <sector>'."
+    if not re.match(r"^\d+$", arg):
+        return f"'{arg}' isn't a sector number. Try 'probe <sector>'."
+
+    target = int(arg)
+    if target < MIN_SECTOR_ID or target > MAX_SECTOR_ID:
+        return f"Sec{target} is out of range. Sectors range from {MIN_SECTOR_ID} to {MAX_SECTOR_ID}."
+    if target == p["sector_id"]:
+        return "The probe's already in your sector -- send it somewhere else."
+
+    graph = get_all_warps()
+    path = find_shortest_path(graph, p["sector_id"], target)
+    if path is None:
+        return f"No route found to Sec{target}."
+
+    consume_probe(p["id"])
+    return run_probe(p, path)
+
+
+def run_probe(p, path):
+    """
+    Fly a launched probe along `path` (which starts at the player's
+    current sector) and build its travelogue. Each sector it reaches is
+    reported with the same info screen the player would see there. The
+    first sector holding a hostile mine destroys the probe -- one mine is
+    spent (detonate_one_hostile_mine), the report ends there, and the
+    rest of the route goes unscouted. Returns the full report string.
+    """
+    hops = path[1:]  # the player's current sector isn't re-reported
+    left = p["probes"] - 1  # one was just consumed launching this probe
+    lines = [f"Probe away to Sec{path[-1]} ({len(hops)} hops); {left} left aboard."]
+    for sector_id in hops:
+        if get_hostile_mine_total(sector_id, p["id"]) > 0:
+            detonate_one_hostile_mine(sector_id, p["id"])
+            lines.append(f"Sec{sector_id}: a mine detonates -- PROBE DESTROYED here.")
+            break
+        lines.append(build_sector_info(sector_id))
+    else:
+        lines.append(f"Probe reached Sec{path[-1]} and signs off.")
+    return "\n".join(lines)
 
 
 def enter_sector(ctx, sector_id, lead, rng=None):

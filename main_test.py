@@ -60,6 +60,7 @@ STATE = {
     "sector_mines": {},
     "mine_log": [],
     "defense_log": [],
+    "probe_log": [],
 }
 
 
@@ -147,6 +148,22 @@ def _stub_clear_hostile_mines(sector_id, player_id):
             del sec[owner]
 
 
+def _stub_consume_probe(player_id):
+    STATE["probe_log"].append(player_id)
+    if STATE["player"].get("id") == player_id:
+        STATE["player"]["probes"] -= 1
+
+
+def _stub_detonate_one_hostile_mine(sector_id, player_id):
+    sec = STATE["sector_mines"].get(sector_id, {})
+    for owner in list(sec):
+        if owner != player_id and sec[owner] > 0:
+            sec[owner] -= 1
+            if sec[owner] <= 0:
+                del sec[owner]
+            return  # only one mine is spent on a probe
+
+
 def _stub_set_ship_defenses(player_id, shields, fighters):
     STATE["defense_log"].append((player_id, shields, fighters))
     STATE["player"]["shields"] = shields
@@ -168,6 +185,8 @@ SHIP_CATALOG = {
         "max_fighters": 50,
         "max_shields": 200,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 10,
     },
     "SS Endeavour": {
         "classification": "Merchant Freighter",
@@ -180,6 +199,8 @@ SHIP_CATALOG = {
         "max_fighters": 10,
         "max_shields": 400,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 10,
     },
     "Bismark": {
         "classification": "Capital Ship",
@@ -192,6 +213,8 @@ SHIP_CATALOG = {
         "max_fighters": 2000,
         "max_shields": 3500,
         "max_mines": 50,
+        "base_probes": 0,
+        "max_probes": 20,
     },
     "Escape Pod": {
         "classification": "Escape Pod",
@@ -204,6 +227,8 @@ SHIP_CATALOG = {
         "max_fighters": 0,
         "max_shields": 0,
         "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 0,
         "purchasable": False,
     },
 }
@@ -224,6 +249,7 @@ def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, 
     player["fighters"] = fighters
     player["shields"] = shields
     player["mines"] = mines
+    player["probes"] = 0
     player["fuel_ore"] = 0
     player["organics"] = 0
     player["equipment"] = 0
@@ -247,12 +273,14 @@ def _install_stub_modules():
     db_stub.lay_mines = _stub_lay_mines
     db_stub.get_hostile_mine_total = _stub_get_hostile_mine_total
     db_stub.clear_hostile_mines = _stub_clear_hostile_mines
+    db_stub.consume_probe = _stub_consume_probe
+    db_stub.detonate_one_hostile_mine = _stub_detonate_one_hostile_mine
     db_stub.set_ship_defenses = _stub_set_ship_defenses
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
     db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
-    db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000}
+    db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000, "probes": 100}
     sys.modules["db"] = db_stub
 
     meshcore_stub = types.ModuleType("meshcore")
@@ -296,6 +324,7 @@ def fresh_player(**overrides):
         "fighters": 0,
         "shields": 0,
         "mines": 0,
+        "probes": 0,
         "fuel_ore": 0,
         "organics": 0,
         "equipment": 0,
@@ -886,7 +915,9 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def enter_shipyard(self):
         await self.dock()
-        return await self.say("4")  # Shipyard is always one past the refits
+        # Shipyard is always one past the refit options. For a Falcon
+        # that's now Holds/Fighters/Shields/Probes -> Shipyard at 5.
+        return await self.say("5")
 
     async def test_shipyard_entry_shows_catalog_with_current_ship_tagged(self):
         STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
@@ -926,13 +957,14 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
         prompt = await self.say("yes")
         self.assertIn("Welcome aboard the Bismark! -23500cr (net).", prompt)
-        # Back at the top-level menu, now with a Mines refit option that
-        # wasn't there for the Falcon, and Shipyard bumped to #5.
+        # Back at the top-level menu, now with Mines and Probes refit
+        # options, so Shipyard sits at #6 (Falcon only reached #5).
         self.assertIn("Cargo Holds 30/125 @ 500cr each", prompt)
         self.assertIn("Fighters 200/2000 @ 50cr each", prompt)
         self.assertIn("Shields 500/3500 @ 25cr each", prompt)
         self.assertIn("Mines 0/50 @ 1000cr each", prompt)
-        self.assertIn("5) Shipyard", prompt)
+        self.assertIn("Probes 0/20 @ 100cr each", prompt)
+        self.assertIn("6) Shipyard", prompt)
 
         final = STATE["player"]
         self.assertEqual(final["ship_type"], "Bismark")
@@ -1117,7 +1149,8 @@ class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("Mines", prompt)
         self.assertIn("3) Shields", prompt)
-        self.assertIn("4) Shipyard", prompt)  # right after the 3 refits, no gap for Mines
+        self.assertIn("4) Probes 0/10 @ 100cr each", prompt)  # universal, fills the Mines gap
+        self.assertIn("5) Shipyard", prompt)  # right after the 4 refits
 
     async def test_mines_appears_for_the_bismark_and_shifts_shipyard(self):
         STATE["player"] = fresh_player(credits=5000, ship_type="Bismark",
@@ -1127,7 +1160,8 @@ class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
         prompt = await self.dock()
 
         self.assertIn("4) Mines 0/50 @ 1000cr each", prompt)
-        self.assertIn("5) Shipyard", prompt)
+        self.assertIn("5) Probes 0/20 @ 100cr each", prompt)
+        self.assertIn("6) Shipyard", prompt)
 
     async def test_buy_mines_full_flow(self):
         STATE["player"] = fresh_player(credits=10000, ship_type="Bismark",
@@ -1439,6 +1473,185 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3) Bismark", prompt)
         self.assertNotIn("4)", prompt)                     # pod not a buy option
         self.assertIn("Sell your Escape Pod", prompt)      # but can be traded back in
+
+
+class CombatMenuTests(unittest.IsolatedAsyncioTestCase):
+    """The combat submenu under help: combat commands are hidden from the
+    top-level menu and listed only by 'combat' / 'help combat'."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["player"] = fresh_player()
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_main_menu_lists_combat_and_hides_combat_commands(self):
+        prompt = await main.cmd_menu(self.ctx(), "")
+
+        self.assertIn("combat -", prompt)            # pointer into the submenu
+        self.assertIn("status -", prompt)            # ordinary command still shown
+        # The combat commands themselves don't clutter the top-level menu.
+        self.assertNotIn("lay mines in this sector", prompt)
+        self.assertNotIn("send a recon probe", prompt)
+
+    async def test_combat_command_lists_lay_and_probe(self):
+        prompt = await main.cmd_combat(self.ctx(), "")
+
+        self.assertIn("Combat commands:", prompt)
+        self.assertIn("lay - lay mines in this sector", prompt)
+        self.assertIn("probe - send a recon probe", prompt)
+        self.assertNotIn("status -", prompt)         # not a combat command
+
+    async def test_help_combat_argument_shows_the_submenu(self):
+        prompt = await main.cmd_menu(self.ctx(), "combat")
+
+        self.assertIn("Combat commands:", prompt)
+        self.assertIn("lay -", prompt)
+        self.assertIn("probe -", prompt)
+
+    async def test_help_unknown_submenu_is_friendly(self):
+        prompt = await main.cmd_menu(self.ctx(), "bogus")
+
+        self.assertIn("(no bogus commands)", prompt)
+
+
+class ProbeRefitTests(unittest.IsolatedAsyncioTestCase):
+    """Buying probes at the Stardock -- a universal refit (100cr each),
+    available to every hull, unlike mines."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["upgrade_log"] = []
+        STATE["port"] = {}
+        STATE["ports"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def dock(self):
+        return await main.cmd_trade(self.ctx(), "")
+
+    async def say(self, message):
+        return await main.cmd_stardock_step(self.ctx(), message)
+
+    async def test_buy_probes_full_flow_on_a_falcon(self):
+        STATE["player"] = fresh_player(credits=1000, ship_type="Falcon", probes=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        prompt = await self.say("4")  # Probes (option 4 for a Falcon)
+        self.assertIn("Probes: 0/10, 100cr each.", prompt)
+        self.assertIn("Buy how many? (0-10, or 'cancel')", prompt)  # 1000cr / 100cr each
+
+        prompt = await self.say("3")
+        self.assertIn("Buy 3 Probes for 300cr (100cr/unit)? yes/no", prompt)
+
+        prompt = await self.say("yes")
+        self.assertIn("Installed 3 Probes for -300cr.", prompt)
+        self.assertIn("Probes 3/10 @ 100cr each", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["probes"], 3)
+        self.assertEqual(final["credits"], 1000 - 300)
+        self.assertEqual(STATE["upgrade_log"], [("probes", 3, 300)])
+
+
+class ProbeCommandTests(unittest.IsolatedAsyncioTestCase):
+    """Launching a recon probe: it scouts a route the player stays out of,
+    is consumed on launch, and dies to a single hostile mine."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["probe_log"] = []
+        STATE["sector_mines"] = {}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["warps"] = chain_warps(30)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_no_probes_aboard_is_rejected(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=0)
+
+        prompt = await main.cmd_probe(self.ctx(), "15")
+
+        self.assertIn("No probes aboard", prompt)
+        self.assertEqual(STATE["probe_log"], [])
+
+    async def test_bad_targets_are_rejected_without_spending_a_probe(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=3)
+
+        self.assertIn("Send a probe where?", await main.cmd_probe(self.ctx(), ""))
+        self.assertIn("isn't a sector number", await main.cmd_probe(self.ctx(), "abc"))
+        self.assertIn("out of range", await main.cmd_probe(self.ctx(), "9999"))
+        self.assertIn("already in your sector", await main.cmd_probe(self.ctx(), "12"))
+
+        self.assertEqual(STATE["probe_log"], [])      # nothing launched
+        self.assertEqual(STATE["player"]["probes"], 3)
+
+    async def test_no_route_found_does_not_spend_a_probe(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=3)
+        STATE["warps"] = {12: [13], 13: [12], 20: []}  # 20 is unreachable
+
+        prompt = await main.cmd_probe(self.ctx(), "20")
+
+        self.assertIn("No route found to Sec20.", prompt)
+        self.assertEqual(STATE["probe_log"], [])
+        self.assertEqual(STATE["player"]["probes"], 3)
+
+    async def test_probe_reports_each_sector_and_reaches_destination(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=3)
+
+        prompt = await main.cmd_probe(self.ctx(), "15")
+
+        self.assertIn("Probe away to Sec15 (3 hops); 2 left aboard.", prompt)
+        # Reports each sector it passes through, as the player would see it.
+        self.assertIn("Sec13", prompt)
+        self.assertIn("Sec14", prompt)
+        self.assertIn("Sec15", prompt)
+        self.assertIn("Probe reached Sec15 and signs off.", prompt)
+        # Consumed exactly one probe; the player never moved.
+        self.assertEqual(STATE["probe_log"], [1])
+        self.assertEqual(STATE["player"]["probes"], 2)
+        self.assertEqual(STATE["player"]["sector_id"], 12)
+
+    async def test_a_single_hostile_mine_destroys_the_probe_and_is_spent(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=2)
+        STATE["sector_mines"] = {14: {2: 3}}  # player 2 laid 3 mines at Sec14
+
+        prompt = await main.cmd_probe(self.ctx(), "16")
+
+        self.assertIn("Sec13", prompt)                      # scouted before the field
+        self.assertIn("Sec14: a mine detonates -- PROBE DESTROYED here.", prompt)
+        self.assertNotIn("Sec15", prompt)                   # route stopped at the mine
+        self.assertNotIn("Probe reached", prompt)
+        # Only ONE mine is spent; the rest of the field remains for real ships.
+        self.assertEqual(STATE["sector_mines"][14], {2: 2})
+        self.assertEqual(STATE["probe_log"], [1])
+
+    async def test_own_mines_do_not_destroy_the_probe(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=2)
+        STATE["sector_mines"] = {14: {1: 5}}  # the probe owner's own mines
+
+        prompt = await main.cmd_probe(self.ctx(), "15")
+
+        self.assertIn("Probe reached Sec15 and signs off.", prompt)
+        self.assertNotIn("DESTROYED", prompt)
+        self.assertEqual(STATE["sector_mines"][14], {1: 5})  # left untouched
 
 
 if __name__ == "__main__":
