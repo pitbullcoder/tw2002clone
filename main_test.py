@@ -461,14 +461,14 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
 
         # 3. Selling freed 5 holds (5 already free + 5 just freed = 10),
         # so the next offer is to buy up to 10 Fuel Ore.
-        self.assertIn("Buy how many? (0-10", prompt)
+        self.assertIn("Buy how many Fuel Ore? (0-10", prompt)
         prompt = await self.say("5")
         self.assertIn("Buy 5 Fuel Ore for 50cr (10cr/unit)?", prompt)
         prompt = await self.say("yes")
         self.assertIn("Bought 5 Fuel Ore for -50cr (10cr/unit).", prompt)
 
         # 4. 5 holds remain free, so the Organics offer is capped at 5.
-        self.assertIn("Buy how many? (0-5", prompt)
+        self.assertIn("Buy how many Organics? (0-5", prompt)
         prompt = await self.say("5")
         self.assertIn("Buy 5 Organics for 75cr (15cr/unit)?", prompt)
         prompt = await self.say("yes")

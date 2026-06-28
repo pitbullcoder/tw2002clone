@@ -191,8 +191,8 @@ def _build_buy_prompt(state, p, port, item):
         return None
     return (
         f"Port sells {label} @ {price}cr each.\n"
-        f"Free holds: {free_holds}, port stock: {stock}, you can afford {max_affordable}.\n"
-        f"Buy how many? (0-{max_qty}, or 'cancel')"
+        f"Free holds: {free_holds}, {label} stock: {stock}, you can afford {max_affordable}.\n"
+        f"Buy how many {label}? (0-{max_qty}, or 'cancel')"
     )
 
 
