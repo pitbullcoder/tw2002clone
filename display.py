@@ -3,7 +3,7 @@ Read-only rendering of game state into the short text screens players
 see: sector info, the per-sector port/warps lines, and the command menu.
 """
 
-from db import get_port, get_adjacent_sectors
+from db import get_port, get_adjacent_sectors, get_players_in_sector
 
 from core import COMMANDS
 
@@ -56,10 +56,23 @@ def format_warps_line(sector_id):
     return f"Warps: {warps}"
 
 
-def build_sector_info(sector_id):
+def build_sector_info(sector_id, viewer_id=None):
     """
     The sector info screen: sector number, then port, then adjacent
     sectors, each on their own line. Shown for the `info` command and
     automatically appended whenever a player's sector actually changes.
+
+    `viewer_id` is the player looking (so they're left out of the ship
+    list below). When other pilots are parked in the sector, a final
+    "Ships here:" line names them; it's omitted entirely when the sector
+    is empty of other ships, so a solo sector reads exactly as before.
     """
-    return f"Sec{sector_id}\n{format_port_line(sector_id)}\n{format_warps_line(sector_id)}"
+    lines = [
+        f"Sec{sector_id}",
+        format_port_line(sector_id),
+        format_warps_line(sector_id),
+    ]
+    others = get_players_in_sector(sector_id, viewer_id)
+    if others:
+        lines.append("Ships here: " + ", ".join(others))
+    return "\n".join(lines)

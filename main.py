@@ -147,7 +147,7 @@ async def cmd_quit(ctx, args):
 
 @command("info", "i", description="show info for your current sector")
 async def cmd_info(ctx, args):
-    return build_sector_info(ctx.player["sector_id"])
+    return build_sector_info(ctx.player["sector_id"], ctx.player["id"])
 
 
 @command("status", "st", description="show credits, sector, ship, turns")
@@ -267,7 +267,7 @@ def run_probe(p, path):
             detonate_one_hostile_mine(sector_id, p["id"])
             lines.append(f"Sec{sector_id}: a mine detonates -- PROBE DESTROYED here.")
             break
-        lines.append(build_sector_info(sector_id))
+        lines.append(build_sector_info(sector_id, p["id"]))
     else:
         lines.append(f"Probe reached Sec{path[-1]} and signs off.")
     return "\n".join(lines)
@@ -302,7 +302,7 @@ def enter_sector(ctx, sector_id, lead, rng=None):
 
     hostile = get_hostile_mine_total(sector_id, p["id"])
     if hostile <= 0:
-        return f"{lead} Sec{sector_id}.\n{build_sector_info(sector_id)}", False
+        return f"{lead} Sec{sector_id}.\n{build_sector_info(sector_id, p['id'])}", False
 
     # The mines go off and are spent, kill or not.
     clear_hostile_mines(sector_id, p["id"])
@@ -317,7 +317,7 @@ def enter_sector(ctx, sector_id, lead, rng=None):
             f"{lead} Sec{sector_id} -- {_plural(hostile, 'mine')} detonate for "
             f"{total_damage} damage! Lost {shields_lost} shields, {fighters_lost} fighters; "
             f"now {shields_after} shields, {fighters_after} fighters.\n"
-            f"{build_sector_info(sector_id)}"
+            f"{build_sector_info(sector_id, p['id'])}"
         )
         return report, False
 
@@ -339,7 +339,7 @@ def enter_sector(ctx, sector_id, lead, rng=None):
     message = (
         f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
         f"{p['ship_type']} is DESTROYED! You eject in an Escape Pod and drift to "
-        f"Sec{landed} (cargo lost, credits intact).\n{build_sector_info(landed)}"
+        f"Sec{landed} (cargo lost, credits intact).\n{build_sector_info(landed, p['id'])}"
     )
     return message, True
 

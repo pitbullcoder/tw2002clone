@@ -536,6 +536,29 @@ def get_player_with_ship(pubkey_prefix):
     return dict(row) if row else None
 
 
+def get_players_in_sector(sector_id, exclude_player_id=None):
+    """Names of the players whose current position is `sector_id`, in
+    stable id order. `exclude_player_id` drops one from the list -- the
+    viewer, so they don't see themselves among the ships present. Note
+    this reflects each player's last recorded sector, not whether they're
+    currently online (the game has no online/offline state beyond the
+    single active-session lock), so it includes pilots parked there and
+    logged off."""
+    conn = get_connection()
+    if exclude_player_id is None:
+        rows = conn.execute(
+            "SELECT name FROM players WHERE sector_id = ? ORDER BY id",
+            (sector_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT name FROM players WHERE sector_id = ? AND id != ? ORDER BY id",
+            (sector_id, exclude_player_id)
+        ).fetchall()
+    conn.close()
+    return [row["name"] for row in rows]
+
+
 def create_player(pubkey_prefix, name):
     """Create a new player + starter ship. Returns the player dict (with ship)."""
     conn = get_connection()

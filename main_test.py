@@ -61,6 +61,10 @@ STATE = {
     "mine_log": [],
     "defense_log": [],
     "probe_log": [],
+    # Player presence fixture: sector_id -> [{"id":, "name":}, ...]. Empty
+    # by default, so build_sector_info shows no "Ships here" line unless a
+    # test populates it (keeping every other suite's output unchanged).
+    "sector_players": {},
 }
 
 
@@ -91,6 +95,12 @@ def _stub_move_player_to_sector(player_id, sector_id):
 
 def _stub_get_player_with_ship(pubkey):
     return dict(STATE["player"])
+
+
+def _stub_get_players_in_sector(sector_id, exclude_player_id=None):
+    here = STATE["sector_players"].get(sector_id, [])
+    return [pl["name"] for pl in here
+            if exclude_player_id is None or pl["id"] != exclude_player_id]
 
 
 def _stub_get_or_create_player(pubkey, sender):
@@ -263,6 +273,7 @@ def _install_stub_modules():
     db_stub.get_or_create_player = _stub_get_or_create_player
     db_stub.reset_turns_if_needed = lambda *a, **k: None
     db_stub.get_player_with_ship = _stub_get_player_with_ship
+    db_stub.get_players_in_sector = _stub_get_players_in_sector
     db_stub.get_adjacent_sectors = _stub_get_adjacent_sectors
     db_stub.get_all_warps = _stub_get_all_warps
     db_stub.get_port = _stub_get_port
@@ -1652,6 +1663,70 @@ class ProbeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Probe reached Sec15 and signs off.", prompt)
         self.assertNotIn("DESTROYED", prompt)
         self.assertEqual(STATE["sector_mines"][14], {1: 5})  # left untouched
+
+
+class SectorPresenceTests(unittest.IsolatedAsyncioTestCase):
+    """Other pilots parked in a sector show up on the info screen; the
+    viewer is left out, and a sector empty of others reads exactly as it
+    did before the feature."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["warps"] = chain_warps(30)
+        STATE["sector_mines"] = {}
+        STATE["sector_players"] = {}
+
+    def tearDown(self):
+        # Don't let a presence fixture leak into other suites' sector info.
+        STATE["sector_players"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_info_lists_other_ships_and_excludes_self(self):
+        STATE["player"] = fresh_player(id=1, sector_id=1)
+        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice"},
+                                       {"id": 2, "name": "Bob"},
+                                       {"id": 3, "name": "Cleo"}]}
+
+        prompt = await main.cmd_info(self.ctx(), "")
+
+        self.assertIn("Ships here: Bob, Cleo", prompt)
+        self.assertNotIn("Alice", prompt)   # the viewer isn't listed among them
+
+    async def test_solo_sector_has_no_ships_line(self):
+        STATE["player"] = fresh_player(id=1, sector_id=1)
+        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice"}]}  # only the viewer
+
+        prompt = await main.cmd_info(self.ctx(), "")
+
+        self.assertNotIn("Ships here", prompt)
+
+    async def test_arriving_shows_who_is_parked_there(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12)
+        # Zane is parked in Sec13; Alice (the viewer) is about to arrive.
+        STATE["sector_players"] = {13: [{"id": 1, "name": "Alice"},
+                                        {"id": 9, "name": "Zane"}]}
+
+        prompt = await main.cmd_move(self.ctx(), "13")
+
+        self.assertIn("Moved to Sec13.", prompt)
+        self.assertIn("Ships here: Zane", prompt)
+        self.assertNotIn("Alice", prompt)
+
+    async def test_probe_reports_ships_in_scouted_sectors(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, probes=2)
+        STATE["sector_players"] = {14: [{"id": 7, "name": "Mara"}]}
+
+        prompt = await main.cmd_probe(self.ctx(), "15")
+
+        self.assertIn("Ships here: Mara", prompt)   # spotted at Sec14 en route
 
 
 if __name__ == "__main__":
