@@ -43,8 +43,13 @@ from db import (
     set_ship_defenses,
     consume_probe,
     detonate_one_hostile_mine,
+    get_ships_in_sector,
+    record_attack_event,
+    pop_attack_events,
     SHIP_CATALOG,
     ESCAPE_POD_SHIP,
+    DEFAULT_SHIP_TYPE,
+    HOME_SECTOR,
 )
 
 import session
@@ -71,7 +76,7 @@ from display import build_menu, build_submenu, build_sector_info, format_port_li
 from pathfinding import find_shortest_path, choose_escape_sector
 # Re-exported so the test suite can reach it as main.sectors_within_hop_range.
 from pathfinding import sectors_within_hop_range  # noqa: F401
-from combat import roll_mine_damage, apply_mine_damage, _plural
+from combat import roll_mine_damage, apply_mine_damage, resolve_attack, _plural
 from trading import cmd_trade, cmd_trade_step, cmd_stardock_step
 
 print("MeshCore bot started...")
@@ -92,10 +97,10 @@ session.ACTIVE_SESSION = None
 __all__ = [
     "Ctx",
     "cmd_menu", "cmd_quit", "cmd_info", "cmd_status",
-    "cmd_combat", "cmd_lay_mines", "cmd_probe",
+    "cmd_combat", "cmd_lay_mines", "cmd_probe", "cmd_attack",
     "cmd_move", "cmd_confirm_warp",
     "cmd_trade", "cmd_trade_step", "cmd_stardock_step",
-    "enter_sector", "run_probe",
+    "enter_sector", "run_probe", "resolve_attack",
     "apply_mine_damage", "choose_escape_sector",
     "sectors_within_hop_range",
     "PENDING_WARPS", "PENDING_TRADES", "PENDING_UPGRADES",
@@ -117,6 +122,13 @@ MAX_SECTOR_ID = 1000  # matches galaxy.py's NUM_SECTORS
 # sector and its immediate neighborhood are a protected safe zone so new
 # players can't be ambushed the moment they leave the Stardock.
 MINE_FREE_SECTORS = 10
+
+
+# --- Ship combat balance ----------------------------------------------
+# When a pilot already in an escape pod is finished off, they don't just
+# lose the pod -- they're wiped back to a fresh start: a default-hull ship
+# at the home sector with their credits reset to this amount.
+POD_KILL_RESET_CREDITS = 20000
 
 
 # Matches anything that *looks* like a number a player might type as a
@@ -270,6 +282,107 @@ def run_probe(p, path):
         lines.append(build_sector_info(sector_id, p["id"]))
     else:
         lines.append(f"Probe reached Sec{path[-1]} and signs off.")
+    return "\n".join(lines)
+
+
+@command("a", "attack", description="attack a ship in your sector: 'a <name>'", menu="combat")
+async def cmd_attack(ctx, args):
+    """
+    Attack another pilot in your sector with fighters (see resolve_attack
+    for the math). Only works when someone else is here. On a kill, an
+    ordinary ship's pilot ejects into an escape pod and drifts to an
+    adjacent sector, losing their hull; finishing off a pilot who's
+    ALREADY in a pod wipes them out -- credits reset and a fresh default
+    ship next login. Either way the victim gets a notice when they sign
+    in (record_attack_event).
+    """
+    p = ctx.player  # attacker
+
+    foes = get_ships_in_sector(p["sector_id"], p["id"])
+    if not foes:
+        return "No other ships here to attack."
+
+    arg = args.strip()
+    if arg:
+        target = next((f for f in foes if f["name"].lower() == arg.lower()), None)
+        if target is None:
+            here = ", ".join(f["name"] for f in foes)
+            return f"No ship named '{arg}' here. Ships here: {here}."
+    elif len(foes) == 1:
+        target = foes[0]
+    else:
+        here = ", ".join(f["name"] for f in foes)
+        return f"Attack who? Ships here: {here}. Try 'a <name>'."
+
+    if p["fighters"] <= 0:
+        return "You have no fighters to attack with."
+
+    atk_after, df_after, ds_after, destroyed = resolve_attack(
+        p["fighters"], target["fighters"], target["shields"]
+    )
+    spent = p["fighters"] - atk_after
+    set_ship_defenses(p["id"], p["shields"], atk_after)  # attacker keeps shields, spends fighters
+
+    if not destroyed:
+        set_ship_defenses(target["id"], ds_after, df_after)
+        record_attack_event(target["id"], p["name"], p["sector_id"], "attacked")
+        return (
+            f"You hit {target['name']} with {_plural(spent, 'fighter')}! "
+            f"They're left with {df_after} fighters, {ds_after} shields. "
+            f"You have {atk_after} fighters."
+        )
+
+    if target["ship_type"] == ESCAPE_POD_SHIP:
+        # Finishing off a pod: total wipe -- fresh default ship, credits
+        # reset, back to the home sector.
+        falcon = SHIP_CATALOG[DEFAULT_SHIP_TYPE]
+        buy_ship(
+            target["id"], DEFAULT_SHIP_TYPE,
+            falcon["base_holds"], falcon["base_fighters"], falcon["base_shields"], falcon["base_mines"],
+            credit_delta=POD_KILL_RESET_CREDITS - target["credits"],
+        )
+        move_player_to_sector(target["id"], HOME_SECTOR)
+        record_attack_event(target["id"], p["name"], p["sector_id"], "pod_destroyed")
+        return (
+            f"You blew apart {target['name']}'s escape pod! They lose everything and "
+            f"restart with {POD_KILL_RESET_CREDITS}cr in a {DEFAULT_SHIP_TYPE} next login. "
+            f"You have {atk_after} fighters."
+        )
+
+    # Ordinary ship destroyed: eject into a pod, drift to an adjacent
+    # sector, lose the hull (credits and cargo go with the ship).
+    pod = SHIP_CATALOG[ESCAPE_POD_SHIP]
+    buy_ship(
+        target["id"], ESCAPE_POD_SHIP,
+        pod["base_holds"], pod["base_fighters"], pod["base_shields"], pod["base_mines"],
+        credit_delta=0,
+    )
+    adjacent = get_adjacent_sectors(p["sector_id"])
+    dest = random.choice(adjacent) if adjacent else p["sector_id"]
+    move_player_to_sector(target["id"], dest)
+    record_attack_event(target["id"], p["name"], p["sector_id"], "destroyed")
+    return (
+        f"You destroyed {target['name']}'s {target['ship_type']}! They eject in an "
+        f"Escape Pod and drift to Sec{dest} (ship lost, credits intact). "
+        f"You have {atk_after} fighters."
+    )
+
+
+def format_attack_notices(events):
+    """Turn queued attack_events (oldest first) into the sign-in briefing a
+    victim sees -- one line each, phrased by outcome, tagged with when."""
+    phrasing = {
+        "attacked": "{who} attacked you in Sec{sec}",
+        "destroyed": "{who} destroyed your ship in Sec{sec}; you ejected in a pod",
+        "pod_destroyed": "{who} blew up your escape pod in Sec{sec}; you were reset",
+    }
+    lines = ["While you were away:"]
+    for e in events:
+        what = phrasing.get(e["outcome"], "{who} attacked you in Sec{sec}").format(
+            who=e["attacker_name"], sec=e["sector_id"]
+        )
+        when = e["created_at"][:16].replace("T", " ")  # YYYY-MM-DD HH:MM, UTC
+        lines.append(f"- {what} ({when} UTC).")
     return "\n".join(lines)
 
 
@@ -523,6 +636,7 @@ async def on_message(mc, event):
         )
         return
 
+    signin_notice = ""
     if session.ACTIVE_SESSION is None:
         if player["turns_remaining"] <= 0:
             print(f"→ {sender} has no turns left, not activating")
@@ -533,6 +647,10 @@ async def on_message(mc, event):
             return
         _activate_session(pubkey, sender)
         print(f"→ {sender} is now active")
+        # Deliver any combat notices that piled up while they were away.
+        events = pop_attack_events(player["id"])
+        if events:
+            signin_notice = format_attack_notices(events) + "\n"
     else:
         _touch_session(pubkey)
 
@@ -568,6 +686,9 @@ async def on_message(mc, event):
     ):
         _release_session(pubkey)
         response += "\n\nYou're out of turns. Logged out to let someone else play."
+
+    if signin_notice:
+        response = signin_notice + response
 
     print(f"→ replying to {sender}: {response}")
     await send_reply(mc, pubkey, sender, response)

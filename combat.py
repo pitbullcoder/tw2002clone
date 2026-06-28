@@ -4,6 +4,7 @@ shields -> fighters -> hull. Pure arithmetic with no db access, so the
 destruction rules are easy to test in isolation.
 """
 
+import math
 import random
 
 
@@ -61,3 +62,55 @@ def _plural(n, noun):
     """'1 mine' / '2 mines' -- naive +s pluralization, fine for the
     handful of nouns the mine messages use."""
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+# Ship-to-ship attack ratios. Fighters trade against the defender's
+# fighters first: the attacker loses ATTACK_FIGHTER_RATIO of a fighter for
+# each defender fighter destroyed (0.75 -> 1000 attacking fighters wipe
+# 1000 defenders and 250 attackers survive). Any fighters left over then
+# strip shields, each surviving fighter taking down ATTACK_SHIELD_RATIO
+# shields before it's spent (10 -> 20 fighters clear 200 shields).
+ATTACK_FIGHTER_RATIO = 0.75
+ATTACK_SHIELD_RATIO = 10
+
+
+def resolve_attack(attacker_fighters, defender_fighters, defender_shields):
+    """
+    Resolve one fighter attack, purely. Returns
+
+        (attacker_fighters_left, defender_fighters_left,
+         defender_shields_left, destroyed)
+
+    Fighters clash first (0.75 attacker fighters spent per defender
+    fighter killed); only once the defender's fighters are gone do leftover
+    attackers hit shields (10 shields stripped per attacker fighter spent).
+    The defender is destroyed only if both their fighters AND shields reach
+    zero AND the attacker still has at least one fighter standing -- exactly
+    spending your last fighter to clear the final shield leaves the
+    defender alive at 0/0, mirroring how mine damage works.
+    """
+    atk = attacker_fighters
+    df = defender_fighters
+    ds = defender_shields
+
+    # Phase 1: fighters vs fighters.
+    clear_fighters_cost = math.ceil(ATTACK_FIGHTER_RATIO * df)
+    if atk >= clear_fighters_cost:
+        atk -= clear_fighters_cost
+        df = 0
+    else:
+        df -= math.floor(atk / ATTACK_FIGHTER_RATIO)
+        atk = 0
+
+    # Phase 2: leftover fighters vs shields (only once fighters are clear).
+    if atk > 0 and df == 0:
+        clear_shields_cost = math.ceil(ds / ATTACK_SHIELD_RATIO)
+        if atk >= clear_shields_cost:
+            atk -= clear_shields_cost
+            ds = 0
+        else:
+            ds -= atk * ATTACK_SHIELD_RATIO
+            atk = 0
+
+    destroyed = (df == 0 and ds == 0 and atk >= 1)
+    return atk, df, ds, destroyed

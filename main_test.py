@@ -65,6 +65,12 @@ STATE = {
     # by default, so build_sector_info shows no "Ships here" line unless a
     # test populates it (keeping every other suite's output unchanged).
     "sector_players": {},
+    # Attack fixtures. players_by_id lets the mutation stubs target a
+    # SECOND player (the defender) instead of the single STATE["player"];
+    # move_log/attack_events record relocation and victim-notice calls.
+    "players_by_id": {},
+    "move_log": [],
+    "attack_events": [],
 }
 
 
@@ -89,8 +95,20 @@ def _stub_get_all_warps():
     return {k: list(v) for k, v in STATE["warps"].items()}
 
 
+def _player_by_id(player_id):
+    """Resolve a player dict by id: the single STATE['player'] (the usual
+    case), or an entry in the players_by_id registry (a second player,
+    e.g. an attack's defender). None if neither knows the id."""
+    if STATE["player"].get("id") == player_id:
+        return STATE["player"]
+    return STATE["players_by_id"].get(player_id)
+
+
 def _stub_move_player_to_sector(player_id, sector_id):
-    STATE["player"]["sector_id"] = sector_id
+    STATE["move_log"].append((player_id, sector_id))
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["sector_id"] = sector_id
 
 
 def _stub_get_player_with_ship(pubkey):
@@ -101,6 +119,31 @@ def _stub_get_players_in_sector(sector_id, exclude_player_id=None):
     here = STATE["sector_players"].get(sector_id, [])
     return [pl["name"] for pl in here
             if exclude_player_id is None or pl["id"] != exclude_player_id]
+
+
+def _stub_get_ships_in_sector(sector_id, exclude_player_id=None):
+    return [
+        dict(pl) for pid, pl in STATE["players_by_id"].items()
+        if pl.get("sector_id") == sector_id and pid != exclude_player_id
+    ]
+
+
+def _stub_record_attack_event(victim_id, attacker_name, sector_id, outcome):
+    STATE["attack_events"].append({
+        "victim_id": victim_id,
+        "attacker_name": attacker_name,
+        "sector_id": sector_id,
+        "outcome": outcome,
+        "created_at": "2026-06-27T12:00:00+00:00",
+    })
+
+
+def _stub_pop_attack_events(player_id):
+    pending = [e for e in STATE["attack_events"]
+               if e["victim_id"] == player_id and not e.get("delivered")]
+    for e in pending:
+        e["delivered"] = True
+    return pending
 
 
 def _stub_get_or_create_player(pubkey, sender):
@@ -176,8 +219,10 @@ def _stub_detonate_one_hostile_mine(sector_id, player_id):
 
 def _stub_set_ship_defenses(player_id, shields, fighters):
     STATE["defense_log"].append((player_id, shields, fighters))
-    STATE["player"]["shields"] = shields
-    STATE["player"]["fighters"] = fighters
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["shields"] = shields
+        pl["fighters"] = fighters
 
 
 # Mirrors db.SHIP_CATALOG -- kept as a separate copy here (rather than
@@ -245,6 +290,7 @@ SHIP_CATALOG = {
 DEFAULT_SHIP_TYPE = "Falcon"
 ESCAPE_POD_SHIP = "Escape Pod"
 SHIP_RESALE_FRACTION = 0.5
+HOME_SECTOR = 1
 
 
 def _stub_sell_value(ship_type):
@@ -253,7 +299,9 @@ def _stub_sell_value(ship_type):
 
 def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit_delta):
     STATE["ship_log"].append((ship_type, holds_total, fighters, shields, mines, credit_delta))
-    player = STATE["player"]
+    player = _player_by_id(player_id)
+    if player is None:
+        return
     player["ship_type"] = ship_type
     player["holds_total"] = holds_total
     player["fighters"] = fighters
@@ -274,6 +322,9 @@ def _install_stub_modules():
     db_stub.reset_turns_if_needed = lambda *a, **k: None
     db_stub.get_player_with_ship = _stub_get_player_with_ship
     db_stub.get_players_in_sector = _stub_get_players_in_sector
+    db_stub.get_ships_in_sector = _stub_get_ships_in_sector
+    db_stub.record_attack_event = _stub_record_attack_event
+    db_stub.pop_attack_events = _stub_pop_attack_events
     db_stub.get_adjacent_sectors = _stub_get_adjacent_sectors
     db_stub.get_all_warps = _stub_get_all_warps
     db_stub.get_port = _stub_get_port
@@ -291,6 +342,7 @@ def _install_stub_modules():
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
     db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
+    db_stub.HOME_SECTOR = HOME_SECTOR
     db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000, "probes": 100}
     sys.modules["db"] = db_stub
 
@@ -327,6 +379,7 @@ PUBKEY = "test-pubkey"
 def fresh_player(**overrides):
     base = {
         "id": 1,
+        "name": "Tester",
         "sector_id": 1,
         "credits": 10000,
         "turns_remaining": 50,
@@ -1727,6 +1780,198 @@ class SectorPresenceTests(unittest.IsolatedAsyncioTestCase):
         prompt = await main.cmd_probe(self.ctx(), "15")
 
         self.assertIn("Ships here: Mara", prompt)   # spotted at Sec14 en route
+
+
+class AttackMathTests(unittest.TestCase):
+    """The pure attack cascade: fighters at 0.75:1, then shields at 10:1."""
+
+    def test_fighters_trade_at_three_quarters(self):
+        # 1000 vs 1000 fighters, no shields: all defenders die, 250 attackers remain.
+        self.assertEqual(main.resolve_attack(1000, 1000, 0), (250, 0, 0, True))
+
+    def test_clearing_shields_with_last_fighter_leaves_target_alive(self):
+        # 20 fighters vs 0 fighters / 200 shields: shields gone, all 20 spent,
+        # attacker now at 0 so the defender survives at 0/0 (not destroyed).
+        self.assertEqual(main.resolve_attack(20, 0, 200), (0, 0, 0, False))
+
+    def test_too_few_fighters_only_dents_the_defenders(self):
+        # 20 attackers vs 1000 defenders: floor(20/0.75)=26 killed, attacker wiped.
+        self.assertEqual(main.resolve_attack(20, 1000, 0), (0, 974, 0, False))
+
+    def test_overwhelming_force_destroys(self):
+        # Clear 100 fighters (cost 75), then 200 shields (cost 20): survive with 905.
+        self.assertEqual(main.resolve_attack(1000, 100, 200), (905, 0, 0, True))
+
+    def test_partial_shield_damage(self):
+        # 5 fighters vs 0 / 200: strip 50 shields, attacker wiped, target lives.
+        self.assertEqual(main.resolve_attack(5, 0, 200), (0, 0, 150, False))
+
+    def test_one_fighter_pops_a_defenseless_pod(self):
+        self.assertEqual(main.resolve_attack(1, 0, 0), (1, 0, 0, True))
+
+    def test_spending_last_fighter_on_fighters_leaves_shields_standing(self):
+        # 75 attackers exactly clear 100 defender fighters; none left for the
+        # 200 shields, so the target survives.
+        self.assertEqual(main.resolve_attack(75, 100, 200), (0, 0, 200, False))
+
+
+class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The `a`/attack command: targeting, fighter write-back, and kills."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["defense_log"] = []
+        STATE["ship_log"] = []
+        STATE["move_log"] = []
+        STATE["attack_events"] = []
+        STATE["players_by_id"] = {}
+        STATE["warps"] = chain_warps(30)   # Sec5 adjacency is [4, 6]
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _defender(self, **over):
+        d = {"id": 2, "name": "Bob", "ship_type": "Bismark",
+             "fighters": 1000, "shields": 200, "sector_id": 5, "credits": 5000}
+        d.update(over)
+        return d
+
+    async def test_no_target_present(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("No other ships here", prompt)
+
+    async def test_no_fighters_to_attack_with(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=0)
+        STATE["players_by_id"] = {2: self._defender()}
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("no fighters", prompt)
+        self.assertEqual(STATE["attack_events"], [])
+
+    async def test_unknown_named_target_is_rejected(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(name="Bob")}
+        prompt = await main.cmd_attack(self.ctx(), "Zara")
+        self.assertIn("No ship named 'Zara'", prompt)
+        self.assertEqual(STATE["attack_events"], [])
+
+    async def test_must_name_target_when_several_present(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(id=2, name="Bob"),
+                                  3: self._defender(id=3, name="Cleo")}
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("Attack who?", prompt)
+
+    async def test_hit_but_not_destroyed_writes_back_both_ships(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=300, shields=10)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        prompt = await main.cmd_attack(self.ctx(), "Bob")
+
+        # 300 attackers kill floor(300/0.75)=400 defenders -> 600 left, attacker wiped.
+        self.assertIn("You have 0 fighters", prompt)
+        self.assertEqual(STATE["player"]["fighters"], 0)   # attacker spent all
+        self.assertEqual(STATE["player"]["shields"], 10)   # attacker shields untouched
+        self.assertEqual(STATE["players_by_id"][2]["fighters"], 600)
+        self.assertEqual(len(STATE["attack_events"]), 1)
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "attacked")
+        self.assertEqual(STATE["attack_events"][0]["victim_id"], 2)
+
+    async def test_destroying_an_ordinary_ship_ejects_to_an_adjacent_pod(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=2000, shields=10)
+        STATE["players_by_id"] = {2: self._defender(ship_type="Bismark",
+                                                    fighters=1000, shields=200, credits=5000)}
+        main.random = FakeRandom(choice_index=1)   # Sec5 adjacency [4, 6] -> pick 6
+
+        prompt = await main.cmd_attack(self.ctx(), "Bob")
+
+        self.assertIn("destroyed Bob's Bismark", prompt)
+        self.assertIn("Sec6", prompt)
+        d = STATE["players_by_id"][2]
+        self.assertEqual(d["ship_type"], "Escape Pod")
+        self.assertEqual(d["sector_id"], 6)
+        self.assertEqual(d["credits"], 5000)               # credits survive
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "destroyed")
+
+    async def test_destroying_a_pod_wipes_the_player_back_to_default(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=50, shields=10)
+        STATE["players_by_id"] = {2: self._defender(ship_type="Escape Pod",
+                                                    fighters=0, shields=0, credits=8000)}
+
+        prompt = await main.cmd_attack(self.ctx(), "Bob")
+
+        self.assertIn("blew apart Bob's escape pod", prompt)
+        d = STATE["players_by_id"][2]
+        self.assertEqual(d["ship_type"], "Falcon")          # back to the default hull
+        self.assertEqual(d["credits"], 20000)               # reset to 20k
+        self.assertEqual(d["sector_id"], 1)                 # back at the home sector
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "pod_destroyed")
+
+
+class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
+    """Victims get a briefing of attacks against them on their next sign-in."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["attack_events"] = []
+
+    def test_format_lists_each_event_by_outcome_and_time(self):
+        events = [
+            {"attacker_name": "Bob", "sector_id": 5, "outcome": "attacked",
+             "created_at": "2026-06-27T12:00:00+00:00"},
+            {"attacker_name": "Cleo", "sector_id": 9, "outcome": "destroyed",
+             "created_at": "2026-06-27T13:30:00+00:00"},
+            {"attacker_name": "Dax", "sector_id": 1, "outcome": "pod_destroyed",
+             "created_at": "2026-06-27T14:00:00+00:00"},
+        ]
+        out = main.format_attack_notices(events)
+        self.assertIn("While you were away:", out)
+        self.assertIn("Bob attacked you in Sec5", out)
+        self.assertIn("Cleo destroyed your ship in Sec9", out)
+        self.assertIn("Dax blew up your escape pod in Sec1", out)
+        self.assertIn("2026-06-27 12:00 UTC", out)
+
+    async def test_pending_notices_are_delivered_on_signin(self):
+        import types as _types
+        import contextlib
+        import io
+
+        STATE["player"] = fresh_player(id=1, sector_id=5, turns_remaining=50)
+        STATE["attack_events"] = [{
+            "victim_id": 1, "attacker_name": "Raider", "sector_id": 5,
+            "outcome": "destroyed", "created_at": "2026-06-27T12:00:00+00:00",
+        }]
+
+        sent = []
+
+        async def fake_send_reply(mc, pubkey, sender, text):
+            sent.append(text)
+
+        main.send_reply = fake_send_reply  # capture instead of hitting the radio
+
+        class _MC:
+            def get_contact_by_key_prefix(self, pubkey):
+                return {"adv_name": "Victim"}
+
+        event = _types.SimpleNamespace(
+            payload={"pubkey_prefix": PUBKEY, "text": "status"}  # no timestamp -> not stale
+        )
+        with contextlib.redirect_stdout(io.StringIO()):  # mute on_message's debug prints
+            await main.on_message(_MC(), event)
+
+        self.assertTrue(sent)
+        self.assertIn("While you were away:", sent[0])
+        self.assertIn("Raider destroyed your ship in Sec5", sent[0])
+        # The notice rides in front of the actual command's reply.
+        self.assertIn("Sec5", sent[0])
 
 
 if __name__ == "__main__":

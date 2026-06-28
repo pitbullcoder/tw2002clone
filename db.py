@@ -121,6 +121,25 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sector_mines_sector ON sector_mines(sector_id)")
 
+    # Combat notices waiting to be delivered to a victim the next time they
+    # sign in: who hit them, where, what happened, and when. `delivered`
+    # flips to 1 once the victim has been shown the notice.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attack_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            victim_id INTEGER NOT NULL REFERENCES players(id),
+            attacker_name TEXT NOT NULL,
+            sector_id INTEGER NOT NULL,
+            outcome TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            delivered INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attack_events_victim "
+        "ON attack_events(victim_id, delivered)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -557,6 +576,65 @@ def get_players_in_sector(sector_id, exclude_player_id=None):
         ).fetchall()
     conn.close()
     return [row["name"] for row in rows]
+
+
+def get_ships_in_sector(sector_id, exclude_player_id=None):
+    """Player+ship rows for everyone currently in `sector_id` (optionally
+    excluding the viewer), as dicts -- enough to pick and resolve an
+    attack target: id, name, ship_type, fighters, shields, credits."""
+    conn = get_connection()
+    sql = """
+        SELECT players.id, players.name, players.credits,
+               ships.ship_type, ships.fighters, ships.shields
+        FROM players
+        JOIN ships ON ships.player_id = players.id
+        WHERE players.sector_id = ?
+    """
+    params = [sector_id]
+    if exclude_player_id is not None:
+        sql += " AND players.id != ?"
+        params.append(exclude_player_id)
+    sql += " ORDER BY players.id"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def record_attack_event(victim_id, attacker_name, sector_id, outcome):
+    """Queue a combat notice for `victim_id` to receive on their next
+    sign-in. `outcome` is a short tag ('attacked', 'destroyed',
+    'pod_destroyed') the presentation layer turns into a message."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO attack_events (victim_id, attacker_name, sector_id, outcome, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (victim_id, attacker_name, sector_id, outcome, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def pop_attack_events(player_id):
+    """Return `player_id`'s undelivered combat notices (oldest first) as
+    dicts, marking them delivered so they're shown only once."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, attacker_name, sector_id, outcome, created_at
+           FROM attack_events
+           WHERE victim_id = ? AND delivered = 0
+           ORDER BY created_at, id""",
+        (player_id,)
+    ).fetchall()
+    events = [dict(row) for row in rows]
+    if events:
+        conn.executemany(
+            "UPDATE attack_events SET delivered = 1 WHERE id = ?",
+            [(e["id"],) for e in events]
+        )
+        conn.commit()
+    conn.close()
+    return events
 
 
 def create_player(pubkey_prefix, name):
