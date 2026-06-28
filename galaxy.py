@@ -8,6 +8,7 @@ This wipes and rebuilds sectors/warps/ports only — it does not touch
 the messages table or any player/ship data (those come later).
 """
 
+import math
 import random
 
 from db import init_db, get_connection
@@ -20,6 +21,19 @@ HOME_SECTOR = 1              # always gets the Stardock
 # Each port class is a 3-letter code for (fuel_ore, organics, equipment) direction.
 # 'B' = port buys from the player (player sells), 'S' = port sells to the player (player buys).
 PORT_CLASSES = ["SSS", "SSB", "SBS", "SBB", "BSS", "BSB", "BBS", "BBB"]
+
+# Complementary port pairs: in each, one port buys exactly what the other
+# sells (and vice versa) across all three commodities, so a trader can
+# shuttle goods back and forth between them for a guaranteed margin. At
+# least PORT_PAIR_FRACTION of all (non-Stardock) ports are placed as one of
+# these pairs sitting in adjacent (warp-connected) sectors. Note SBS/BSB is
+# also complementary but intentionally left out of this list.
+PORT_PAIRS = [
+    ("SBB", "BSS"),
+    ("BBS", "SSB"),
+    ("BBB", "SSS"),
+]
+PORT_PAIR_FRACTION = 0.05
 
 # (min_qty, max_qty) per commodity -- capacity range, independent of
 # whether a given port buys or sells that commodity.
@@ -105,53 +119,114 @@ def generate_warps(conn):
     )
 
 
-def generate_ports(conn):
-    sector_ids = list(range(1, NUM_SECTORS + 1))
-    sector_ids.remove(HOME_SECTOR)
+def _build_port_row(sector_id, port_class):
+    """Build the full ports-table row tuple for a commodity port of the
+    given class. Quantity capacities and prices are rolled per commodity
+    from the ranges above; selling commodities ('S') start fully stocked,
+    buying commodities ('B') start empty (see the qty note below)."""
+    fuel_dir, organics_dir, equip_dir = port_class[0], port_class[1], port_class[2]
 
+    commodity_data = {}
+    for commodity, direction in (
+        ("fuel_ore", fuel_dir),
+        ("organics", organics_dir),
+        ("equipment", equip_dir),
+    ):
+        min_qty, max_qty = QUANTITY_RANGES[commodity]
+        capacity = random.randint(min_qty, max_qty)
+        min_price, max_price = (
+            _sell_price_range(commodity) if direction == "S" else BUY_PRICE_RANGES[commodity]
+        )
+        price = random.randint(min_price, max_price)
+        # Selling ports ('S') start fully stocked (qty = capacity) -- they
+        # have product on hand ready to sell to traders. Buying ports ('B')
+        # start empty (qty = 0) -- they have demand for product they don't
+        # have yet, which is what gives traders something to sell *to* them.
+        # Capacity (the max column) is the same random range either way;
+        # only the starting qty differs by direction.
+        starting_qty = capacity if direction == "S" else 0
+        commodity_data[commodity] = (starting_qty, capacity, price)
+
+    return (
+        sector_id, port_class, fuel_dir, organics_dir, equip_dir,
+        commodity_data["fuel_ore"][0], commodity_data["organics"][0], commodity_data["equipment"][0],
+        commodity_data["fuel_ore"][1], commodity_data["organics"][1], commodity_data["equipment"][1],
+        commodity_data["fuel_ore"][2], commodity_data["organics"][2], commodity_data["equipment"][2],
+    )
+
+
+def _read_adjacency(conn):
+    """Undirected adjacency map {sector_id: {neighbor, ...}} read back from
+    the warps just inserted (visible on this connection before commit)."""
+    adjacency = {}
+    for from_id, to_id in conn.execute("SELECT from_sector_id, to_sector_id FROM warps"):
+        adjacency.setdefault(from_id, set()).add(to_id)
+    return adjacency
+
+
+def _choose_adjacent_pairs(adjacency, num_pairs, exclude=()):
+    """Pick up to `num_pairs` vertex-disjoint warp edges (neither endpoint
+    reused across pairs, none touching an excluded sector), so each chosen
+    pair is two adjacent sectors free to host a complementary port pair.
+    Returns a list of (sector_a, sector_b) tuples -- fewer than requested
+    only if the graph runs out of disjoint edges."""
+    exclude = set(exclude)
+    edges = set()
+    for a, neighbors in adjacency.items():
+        if a in exclude:
+            continue
+        for b in neighbors:
+            if b in exclude:
+                continue
+            edges.add(tuple(sorted((a, b))))
+
+    edges = list(edges)
+    random.shuffle(edges)
+
+    chosen = []
+    used = set()
+    for a, b in edges:
+        if a in used or b in used:
+            continue
+        chosen.append((a, b))
+        used.update((a, b))
+        if len(chosen) >= num_pairs:
+            break
+    return chosen
+
+
+def generate_ports(conn):
     num_ports = int(NUM_SECTORS * PORT_DENSITY)
-    port_sectors = random.sample(sector_ids, num_ports)
 
     rows = []
 
-    # Stardock at the home sector — special, no commodity trading in v1.
+    # Stardock at the home sector -- special, no commodity trading in v1.
     rows.append((
         HOME_SECTOR, "STARDOCK", None, None, None,
         0, 0, 0, 0, 0, 0, 0, 0, 0
     ))
 
-    for sector_id in port_sectors:
-        port_class = random.choice(PORT_CLASSES)
-        fuel_dir, organics_dir, equip_dir = port_class[0], port_class[1], port_class[2]
+    used = {HOME_SECTOR}
 
-        commodity_data = {}
-        for commodity, direction in (
-            ("fuel_ore", fuel_dir),
-            ("organics", organics_dir),
-            ("equipment", equip_dir),
-        ):
-            min_qty, max_qty = QUANTITY_RANGES[commodity]
-            capacity = random.randint(min_qty, max_qty)
-            min_price, max_price = (
-                _sell_price_range(commodity) if direction == "S" else BUY_PRICE_RANGES[commodity]
-            )
-            price = random.randint(min_price, max_price)
-            # Selling ports ('S') start fully stocked (qty = capacity) --
-            # they have product on hand ready to sell to traders. Buying
-            # ports ('B') start empty (qty = 0) -- they have demand for
-            # product they don't have yet, which is what gives traders
-            # something to sell *to* them. Capacity (the max column) is
-            # the same random range either way; only the starting qty
-            # differs by direction.
-            starting_qty = capacity if direction == "S" else 0
-            commodity_data[commodity] = (starting_qty, capacity, price)
+    # Place complementary pairs first, in adjacent sectors. We need at
+    # least PORT_PAIR_FRACTION of the ports to be paired; since each pair is
+    # two ports, that's ceil(fraction * num_ports / 2) pairs.
+    num_pairs = math.ceil(PORT_PAIR_FRACTION * num_ports / 2)
+    adjacency = _read_adjacency(conn)
+    for sector_a, sector_b in _choose_adjacent_pairs(adjacency, num_pairs, exclude={HOME_SECTOR}):
+        class_a, class_b = random.choice(PORT_PAIRS)
+        if random.random() < 0.5:
+            class_a, class_b = class_b, class_a  # which sector gets which half
+        rows.append(_build_port_row(sector_a, class_a))
+        rows.append(_build_port_row(sector_b, class_b))
+        used.update((sector_a, sector_b))
 
-        rows.append((
-            sector_id, port_class, fuel_dir, organics_dir, equip_dir,
-            commodity_data["fuel_ore"][0], commodity_data["organics"][0], commodity_data["equipment"][0],
-            commodity_data["fuel_ore"][1], commodity_data["organics"][1], commodity_data["equipment"][1],
-            commodity_data["fuel_ore"][2], commodity_data["organics"][2], commodity_data["equipment"][2],
-        ))
+    # Fill the remaining port budget with standalone ports of random class,
+    # in sectors not already used by the Stardock or a pair.
+    remaining = num_ports - (len(rows) - 1)  # rows so far minus the Stardock
+    pool = [s for s in range(1, NUM_SECTORS + 1) if s not in used]
+    for sector_id in random.sample(pool, min(remaining, len(pool))):
+        rows.append(_build_port_row(sector_id, random.choice(PORT_CLASSES)))
 
     conn.executemany(
         """INSERT INTO ports (
