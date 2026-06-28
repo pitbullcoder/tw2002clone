@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 DB_PATH = "meshcore_messages.db"
 
@@ -147,7 +148,26 @@ def init_db():
 # --- Game balance constants ---
 HOME_SECTOR = 1
 STARTING_CREDITS = 1000
-DAILY_TURNS = 50
+DAILY_TURNS = 100
+
+# Turns refill once a day at this hour, Eastern time. America/New_York
+# (rather than a fixed UTC offset) keeps "3am Eastern" correct through
+# daylight-saving changes.
+TURN_RESET_HOUR = 3
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _last_reset_boundary(now_utc):
+    """The most recent daily reset instant (TURN_RESET_HOUR Eastern), as a
+    UTC datetime. A player whose last_turn_reset predates this is due for a
+    refill."""
+    now_eastern = now_utc.astimezone(_EASTERN)
+    boundary = now_eastern.replace(
+        hour=TURN_RESET_HOUR, minute=0, second=0, microsecond=0
+    )
+    if now_eastern < boundary:
+        boundary -= timedelta(days=1)  # today's 3am hasn't arrived yet
+    return boundary.astimezone(timezone.utc)
 
 DEFAULT_SHIP_TYPE = "Falcon"
 
@@ -670,7 +690,11 @@ def get_or_create_player(pubkey_prefix, name):
 
 
 def reset_turns_if_needed(player_id):
-    """Resets turns_remaining to DAILY_TURNS if more than 24h have passed since last reset."""
+    """Refill turns to DAILY_TURNS if the player hasn't been reset since
+    the most recent daily reset boundary (3am Eastern). Checked on sign-in,
+    so there's no maintenance job: the first time a player is seen after
+    3am Eastern, their turns top back up. Using America/New_York means the
+    boundary tracks EST/EDT automatically across daylight-saving changes."""
     conn = get_connection()
     row = conn.execute(
         "SELECT last_turn_reset FROM players WHERE id = ?", (player_id,)
@@ -679,13 +703,28 @@ def reset_turns_if_needed(player_id):
     last_reset = datetime.fromisoformat(row["last_turn_reset"])
     now = datetime.now(timezone.utc)
 
-    if now - last_reset > timedelta(hours=24):
+    if last_reset < _last_reset_boundary(now):
         conn.execute(
             "UPDATE players SET turns_remaining = ?, last_turn_reset = ? WHERE id = ?",
             (DAILY_TURNS, now.isoformat(), player_id)
         )
         conn.commit()
 
+    conn.close()
+
+
+def spend_turn(player_id):
+    """Charge a single turn for a sector-to-sector move, never dropping
+    below zero (the WHERE guard makes a spend at 0 turns a no-op). Other
+    actions -- trading, attacking, laying mines, sending probes -- are
+    free; only physically moving costs a turn."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET turns_remaining = turns_remaining - 1 "
+        "WHERE id = ? AND turns_remaining > 0",
+        (player_id,)
+    )
+    conn.commit()
     conn.close()
 
 

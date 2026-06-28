@@ -31,6 +31,7 @@ from db import (
     log_message,
     get_or_create_player,
     reset_turns_if_needed,
+    spend_turn,
     get_player_with_ship,
     get_adjacent_sectors,
     get_all_warps,
@@ -411,6 +412,7 @@ def enter_sector(ctx, sector_id, lead, rng=None):
     pubkey = ctx.pubkey
 
     move_player_to_sector(ctx.player["id"], sector_id)
+    spend_turn(ctx.player["id"])  # each sector-to-sector move costs a turn
     p = get_player_with_ship(pubkey)  # fresh defenses to test the hit against
 
     hostile = get_hostile_mine_total(sector_id, p["id"])

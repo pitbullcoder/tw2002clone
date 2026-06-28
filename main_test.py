@@ -111,6 +111,12 @@ def _stub_move_player_to_sector(player_id, sector_id):
         pl["sector_id"] = sector_id
 
 
+def _stub_spend_turn(player_id):
+    pl = _player_by_id(player_id)
+    if pl is not None and pl.get("turns_remaining", 0) > 0:
+        pl["turns_remaining"] -= 1
+
+
 def _stub_get_player_with_ship(pubkey):
     return dict(STATE["player"])
 
@@ -329,6 +335,7 @@ def _install_stub_modules():
     db_stub.get_all_warps = _stub_get_all_warps
     db_stub.get_port = _stub_get_port
     db_stub.move_player_to_sector = _stub_move_player_to_sector
+    db_stub.spend_turn = _stub_spend_turn
     db_stub.execute_trade = _stub_execute_trade
     db_stub.upgrade_ship_stat = _stub_upgrade_ship_stat
     db_stub.buy_ship = _stub_buy_ship
@@ -1972,6 +1979,65 @@ class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Raider destroyed your ship in Sec5", sent[0])
         # The notice rides in front of the actual command's reply.
         self.assertIn("Sec5", sent[0])
+
+
+class TurnCostTests(unittest.IsolatedAsyncioTestCase):
+    """Moving between sectors costs a turn; nothing else does, and a
+    player relocated by someone else's attack isn't charged."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["warps"] = chain_warps(30)
+        STATE["sector_mines"] = {}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["move_log"] = []
+        STATE["players_by_id"] = {}
+        STATE["attack_events"] = []
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_direct_adjacent_move_costs_one_turn(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, turns_remaining=100)
+        await main.cmd_move(self.ctx(), "13")  # 13 is adjacent to 12
+        self.assertEqual(STATE["player"]["sector_id"], 13)
+        self.assertEqual(STATE["player"]["turns_remaining"], 99)
+
+    async def test_plotting_is_free_but_each_warp_hop_costs_a_turn(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, turns_remaining=100)
+
+        prompt = await main.cmd_move(self.ctx(), "15")  # 3-hop course
+        self.assertIn("Plotted", prompt)
+        self.assertEqual(STATE["player"]["turns_remaining"], 100)  # plotting costs nothing
+
+        for expected_turns, expected_sector in [(99, 13), (98, 14), (97, 15)]:
+            await main.cmd_confirm_warp(self.ctx(), "yes")
+            self.assertEqual(STATE["player"]["sector_id"], expected_sector)
+            self.assertEqual(STATE["player"]["turns_remaining"], expected_turns)
+
+    async def test_non_move_commands_are_free(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, turns_remaining=100)
+        await main.cmd_status(self.ctx(), "")
+        await main.cmd_info(self.ctx(), "")
+        self.assertEqual(STATE["player"]["turns_remaining"], 100)
+
+    async def test_being_knocked_into_a_pod_by_an_attack_costs_no_turn(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=2000, turns_remaining=100)
+        STATE["players_by_id"] = {2: {
+            "id": 2, "name": "Bob", "ship_type": "Bismark", "fighters": 10,
+            "shields": 0, "sector_id": 5, "credits": 5000, "turns_remaining": 100,
+        }}
+        main.random = FakeRandom(choice_index=0)
+
+        await main.cmd_attack(self.ctx(), "Bob")
+
+        self.assertEqual(STATE["player"]["turns_remaining"], 100)            # attacker didn't move
+        self.assertEqual(STATE["players_by_id"][2]["turns_remaining"], 100)  # victim's knockback is free
 
 
 if __name__ == "__main__":
