@@ -1,4 +1,4 @@
-# tw2002clone
+# TradeWars 2002 Clone for MeshCore
 
 A multiplayer space trading-and-combat game inspired by the classic
 **TradeWars 2002** BBS door game, played entirely over a **MeshCore /
