@@ -30,6 +30,14 @@ PENDING_TRADES = {}
 PENDING_UPGRADES = {}
 
 
+# pubkey -> dict {"target_id":, "target_name":} for an attack that's been
+# aimed at a ship in the sector but is waiting on the attacker to say how
+# many fighters to commit. Populated by cmd_attack, consumed by
+# cmd_attack_step (which re-fetches the target's live ship row before
+# resolving, so a stale count can't be acted on).
+PENDING_ATTACKS = {}
+
+
 # Map of command -> (description, async handler(ctx, args) -> str)
 COMMANDS = {}
 

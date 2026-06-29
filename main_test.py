@@ -29,6 +29,7 @@ It expects main.py to be importable from the same directory.
 """
 
 import importlib
+import itertools
 import sys
 import types
 import unittest
@@ -71,6 +72,11 @@ STATE = {
     "players_by_id": {},
     "move_log": [],
     "attack_events": [],
+    # Public kill-log fixtures. "kills" is the global append-only log (the
+    # record_kill stub appends here); "kill_log_cutoff" maps player_id ->
+    # the timestamp through which they've seen the log (their last sign-in).
+    "kills": [],
+    "kill_log_cutoff": {},
 }
 
 
@@ -122,8 +128,12 @@ def _stub_get_player_with_ship(pubkey):
 
 
 def _stub_get_players_in_sector(sector_id, exclude_player_id=None):
+    # Mirrors the real db.get_players_in_sector's new contract: a list of
+    # {"name", "fighters"} dicts. Presence fixtures carry "fighters" (and
+    # may carry "shields", which this deliberately drops -- shields never
+    # surface on the sector-info screen).
     here = STATE["sector_players"].get(sector_id, [])
-    return [pl["name"] for pl in here
+    return [{"name": pl["name"], "fighters": pl.get("fighters", 0)} for pl in here
             if exclude_player_id is None or pl["id"] != exclude_player_id]
 
 
@@ -150,6 +160,46 @@ def _stub_pop_attack_events(player_id):
     for e in pending:
         e["delivered"] = True
     return pending
+
+
+# Shared monotonic fake clock for the kill-log stubs. record_kill and
+# mark_kill_log_seen both pull from it, so their timestamps order by call
+# order exactly as the real wall-clock now() would -- a kill recorded
+# after a sign-in lands *after* that sign-in's cutoff, etc. Fixed-width
+# and zero-padded so the strings sort lexicographically.
+_kill_clock = itertools.count(1)
+
+
+def _kill_ts():
+    return f"2026-06-27T12:00:00.{next(_kill_clock):09d}+00:00"
+
+
+def _stub_record_kill(victim_name, killer_name, sector_id, kind):
+    STATE["kills"].append({
+        "victim_name": victim_name,
+        "killer_name": killer_name,
+        "sector_id": sector_id,
+        "kind": kind,
+        "created_at": _kill_ts(),
+    })
+
+
+def _stub_get_kills_since(cutoff_iso, limit=None):
+    if cutoff_iso is None:
+        return []
+    res = sorted((k for k in STATE["kills"] if k["created_at"] > cutoff_iso),
+                 key=lambda k: k["created_at"])
+    if limit is not None:
+        res = res[:limit]
+    return [dict(k) for k in res]
+
+
+def _stub_get_kill_log_cutoff(player_id):
+    return STATE["kill_log_cutoff"].get(player_id)
+
+
+def _stub_mark_kill_log_seen(player_id):
+    STATE["kill_log_cutoff"][player_id] = _kill_ts()
 
 
 def _stub_get_or_create_player(pubkey, sender):
@@ -297,6 +347,7 @@ DEFAULT_SHIP_TYPE = "Falcon"
 ESCAPE_POD_SHIP = "Escape Pod"
 SHIP_RESALE_FRACTION = 0.5
 HOME_SECTOR = 1
+SAFE_ZONE_MAX_SECTOR = 10
 
 
 def _stub_sell_value(ship_type):
@@ -331,6 +382,10 @@ def _install_stub_modules():
     db_stub.get_ships_in_sector = _stub_get_ships_in_sector
     db_stub.record_attack_event = _stub_record_attack_event
     db_stub.pop_attack_events = _stub_pop_attack_events
+    db_stub.record_kill = _stub_record_kill
+    db_stub.get_kills_since = _stub_get_kills_since
+    db_stub.get_kill_log_cutoff = _stub_get_kill_log_cutoff
+    db_stub.mark_kill_log_seen = _stub_mark_kill_log_seen
     db_stub.get_adjacent_sectors = _stub_get_adjacent_sectors
     db_stub.get_all_warps = _stub_get_all_warps
     db_stub.get_port = _stub_get_port
@@ -350,6 +405,7 @@ def _install_stub_modules():
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
     db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
     db_stub.HOME_SECTOR = HOME_SECTOR
+    db_stub.SAFE_ZONE_MAX_SECTOR = SAFE_ZONE_MAX_SECTOR
     db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000, "probes": 100}
     sys.modules["db"] = db_stub
 
@@ -1459,6 +1515,8 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         STATE["ship_log"] = []
         STATE["mine_log"] = []
         STATE["defense_log"] = []
+        STATE["kills"] = []
+        STATE["kill_log_cutoff"] = {}
         STATE["sector_mines"] = {}
         STATE["ports"] = {}
         STATE["port"] = {}
@@ -1515,6 +1573,12 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(landed, set(main.sectors_within_hop_range(STATE["warps"], 13, 4, 6)))
         self.assertEqual(len(STATE["ship_log"]), 1)
         self.assertEqual(STATE["ship_log"][0][0], "Escape Pod")
+        # A public kill is logged, credited to mines (no killer name).
+        self.assertEqual(STATE["kills"][-1], {
+            "victim_name": "Tester", "killer_name": None,
+            "sector_id": 13, "kind": "ship",
+            "created_at": STATE["kills"][-1]["created_at"],
+        })
 
     async def test_death_mid_route_cancels_the_rest_of_the_course(self):
         STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
@@ -1529,6 +1593,49 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
 
         prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
         self.assertIn("DESTROYED", prompt)
+        self.assertNotIn("Warp to:", prompt)              # route abandoned
+        self.assertNotIn(PUBKEY, main.PENDING_WARPS)
+
+    async def test_pod_into_mines_is_a_total_reset_not_another_pod(self):
+        # A pilot already flying an Escape Pod has nothing to eject into,
+        # so hitting mines wipes them out exactly like having their pod
+        # shot in combat: a fresh Falcon, credits reset, back at the home
+        # Stardock -- NOT another drifting pod.
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Escape Pod",
+                                       shields=0, fighters=0, credits=8000)
+        STATE["port"] = fresh_port("STARDOCK")    # so Sec1 renders as the Stardock
+        STATE["sector_mines"] = {13: {2: 3}}
+        main.random = FakeRandom([10, 10, 10])    # any damage is lethal to a pod
+
+        prompt = await main.cmd_move(self.ctx(), "13")
+
+        self.assertIn("Escape Pod is GONE", prompt)
+        self.assertIn("restart with 20000cr in a Falcon", prompt)
+
+        final = STATE["player"]
+        self.assertEqual(final["ship_type"], "Falcon")     # not another Escape Pod
+        self.assertEqual(final["credits"], 20000)          # reset to 20k
+        self.assertEqual(final["sector_id"], 1)            # back at the home Stardock
+        self.assertEqual(final["holds_total"], SHIP_CATALOG["Falcon"]["base_holds"])
+        self.assertEqual(STATE["ship_log"][-1][0], "Falcon")
+        # Logged as a public mine kill of the pod (kind 'pod', no killer).
+        self.assertEqual(STATE["kills"][-1]["killer_name"], None)
+        self.assertEqual(STATE["kills"][-1]["victim_name"], "Tester")
+        self.assertEqual(STATE["kills"][-1]["kind"], "pod")
+        self.assertEqual(STATE["kills"][-1]["sector_id"], 13)
+
+    async def test_pod_reset_mid_route_drops_the_rest_of_the_course(self):
+        STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Escape Pod",
+                                       shields=0, fighters=0, credits=8000)
+        STATE["sector_mines"] = {13: {2: 3}}
+        main.random = FakeRandom([10, 10, 10])
+
+        # Plot 12 -> 13 -> 14 -> 15; the first hop lands on the mines.
+        prompt = await main.cmd_move(self.ctx(), "15")
+        self.assertEqual(main.PENDING_WARPS[PUBKEY], [13, 14, 15])
+
+        prompt = await main.cmd_confirm_warp(self.ctx(), "yes")
+        self.assertIn("Escape Pod is GONE", prompt)
         self.assertNotIn("Warp to:", prompt)              # route abandoned
         self.assertNotIn(PUBKEY, main.PENDING_WARPS)
 
@@ -1751,18 +1858,32 @@ class SectorPresenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_info_lists_other_ships_and_excludes_self(self):
         STATE["player"] = fresh_player(id=1, sector_id=1)
-        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice"},
-                                       {"id": 2, "name": "Bob"},
-                                       {"id": 3, "name": "Cleo"}]}
+        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice", "fighters": 5},
+                                       {"id": 2, "name": "Bob", "fighters": 1000},
+                                       {"id": 3, "name": "Cleo", "fighters": 3}]}
 
         prompt = await main.cmd_info(self.ctx(), "")
 
-        self.assertIn("Ships here: Bob, Cleo", prompt)
+        self.assertIn("Ships here: Bob (1000 ftr), Cleo (3 ftr)", prompt)
         self.assertNotIn("Alice", prompt)   # the viewer isn't listed among them
+
+    async def test_opponent_fighters_shown_but_shields_hidden(self):
+        # A nosy pilot can read fighter strength off the info screen but
+        # never an opponent's shields -- those stay secret until combat.
+        STATE["player"] = fresh_player(id=1, sector_id=1)
+        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice", "fighters": 0},
+                                       {"id": 2, "name": "Bob",
+                                        "fighters": 7, "shields": 999}]}
+
+        prompt = await main.cmd_info(self.ctx(), "")
+
+        self.assertIn("Bob (7 ftr)", prompt)
+        self.assertNotIn("999", prompt)               # shield count never leaks
+        self.assertNotIn("shield", prompt.lower())     # nor even the word
 
     async def test_solo_sector_has_no_ships_line(self):
         STATE["player"] = fresh_player(id=1, sector_id=1)
-        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice"}]}  # only the viewer
+        STATE["sector_players"] = {1: [{"id": 1, "name": "Alice", "fighters": 0}]}  # only the viewer
 
         prompt = await main.cmd_info(self.ctx(), "")
 
@@ -1771,22 +1892,22 @@ class SectorPresenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_arriving_shows_who_is_parked_there(self):
         STATE["player"] = fresh_player(id=1, sector_id=12)
         # Zane is parked in Sec13; Alice (the viewer) is about to arrive.
-        STATE["sector_players"] = {13: [{"id": 1, "name": "Alice"},
-                                        {"id": 9, "name": "Zane"}]}
+        STATE["sector_players"] = {13: [{"id": 1, "name": "Alice", "fighters": 0},
+                                        {"id": 9, "name": "Zane", "fighters": 42}]}
 
         prompt = await main.cmd_move(self.ctx(), "13")
 
         self.assertIn("Moved to Sec13.", prompt)
-        self.assertIn("Ships here: Zane", prompt)
+        self.assertIn("Ships here: Zane (42 ftr)", prompt)
         self.assertNotIn("Alice", prompt)
 
     async def test_probe_reports_ships_in_scouted_sectors(self):
         STATE["player"] = fresh_player(id=1, sector_id=12, probes=2)
-        STATE["sector_players"] = {14: [{"id": 7, "name": "Mara"}]}
+        STATE["sector_players"] = {14: [{"id": 7, "name": "Mara", "fighters": 8}]}
 
         prompt = await main.cmd_probe(self.ctx(), "15")
 
-        self.assertIn("Ships here: Mara", prompt)   # spotted at Sec14 en route
+        self.assertIn("Ships here: Mara (8 ftr)", prompt)   # spotted at Sec14 en route
 
 
 class AttackMathTests(unittest.TestCase):
@@ -1835,49 +1956,156 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
         STATE["ship_log"] = []
         STATE["move_log"] = []
         STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["kill_log_cutoff"] = {}
         STATE["players_by_id"] = {}
-        STATE["warps"] = chain_warps(30)   # Sec5 adjacency is [4, 6]
+        # Sec15 is the staging sector for these fights -- outside the
+        # Sec1-10 no-combat safe zone. In chain_warps(30) its neighbors
+        # are [14, 16].
+        STATE["warps"] = chain_warps(30)
 
     def ctx(self):
         return FakeCtx(PUBKEY, dict(STATE["player"]))
 
+    async def _aim_and_commit(self, args, reply):
+        """Drive the two-step attack: aim with cmd_attack, then answer the
+        'how many fighters?' prompt with `reply` (a number, 'all', or
+        'cancel') via cmd_attack_step. Returns the step's reply."""
+        await main.cmd_attack(self.ctx(), args)
+        return await main.cmd_attack_step(self.ctx(), reply)
+
     def _defender(self, **over):
         d = {"id": 2, "name": "Bob", "ship_type": "Bismark",
-             "fighters": 1000, "shields": 200, "sector_id": 5, "credits": 5000}
+             "fighters": 1000, "shields": 200, "sector_id": 15, "credits": 5000}
         d.update(over)
         return d
 
-    async def test_no_target_present(self):
+    async def test_combat_is_banned_in_the_safe_zone(self):
+        # Same setup as a normal fight, but inside the Sec1-10 safe zone:
+        # the attack is refused outright, nothing fires, nothing pends.
         STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(sector_id=5)}
+
+        prompt = await main.cmd_attack(self.ctx(), "Bob")
+
+        self.assertIn("safe zone", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)   # no attack queued
+        self.assertEqual(STATE["defense_log"], [])       # no shots fired
+        self.assertEqual(STATE["attack_events"], [])
+        self.assertEqual(STATE["players_by_id"][2]["fighters"], 1000)
+
+    async def test_no_target_present(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
         prompt = await main.cmd_attack(self.ctx(), "")
         self.assertIn("No other ships here", prompt)
 
     async def test_no_fighters_to_attack_with(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=0)
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=0)
         STATE["players_by_id"] = {2: self._defender()}
         prompt = await main.cmd_attack(self.ctx(), "")
         self.assertIn("no fighters", prompt)
         self.assertEqual(STATE["attack_events"], [])
 
     async def test_unknown_named_target_is_rejected(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
         STATE["players_by_id"] = {2: self._defender(name="Bob")}
         prompt = await main.cmd_attack(self.ctx(), "Zara")
         self.assertIn("No ship named 'Zara'", prompt)
         self.assertEqual(STATE["attack_events"], [])
 
     async def test_must_name_target_when_several_present(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
         STATE["players_by_id"] = {2: self._defender(id=2, name="Bob"),
                                   3: self._defender(id=3, name="Cleo")}
         prompt = await main.cmd_attack(self.ctx(), "")
         self.assertIn("Attack who?", prompt)
 
-    async def test_hit_but_not_destroyed_writes_back_both_ships(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=300, shields=10)
+    async def test_aiming_prompts_for_a_fighter_count_without_firing(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
         STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
 
         prompt = await main.cmd_attack(self.ctx(), "Bob")
+
+        self.assertIn("how many fighters", prompt)
+        self.assertIn("500", prompt)                       # advertises what's aboard
+        self.assertIn(PUBKEY, main.PENDING_ATTACKS)        # attack is now pending
+        self.assertEqual(STATE["defense_log"], [])         # nothing fired yet
+        self.assertEqual(STATE["attack_events"], [])
+        self.assertEqual(STATE["players_by_id"][2]["fighters"], 1000)  # defender untouched
+
+    async def test_committing_a_subset_keeps_the_reserve(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500, shields=10)
+        STATE["players_by_id"] = {2: self._defender(fighters=100, shields=0)}
+
+        prompt = await self._aim_and_commit("Bob", "75")
+
+        # 75 fighters exactly clear 100 defenders (cost ceil(0.75*100)=75),
+        # none left over -> defender lives at 0; the 425 reserve is kept.
+        self.assertIn("You have 425 fighters", prompt)
+        self.assertEqual(STATE["player"]["fighters"], 425)   # 500 total - 75 engaged
+        self.assertEqual(STATE["players_by_id"][2]["fighters"], 0)
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "attacked")
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)       # flow is finished
+        self.assertEqual(STATE["kills"], [])                 # a mere hit isn't a kill
+
+    async def test_cancel_aborts_the_attack(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        await main.cmd_attack(self.ctx(), "Bob")
+        prompt = await main.cmd_attack_step(self.ctx(), "cancel")
+
+        self.assertIn("called off", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)
+        self.assertEqual(STATE["defense_log"], [])           # no shots fired
+        self.assertEqual(STATE["attack_events"], [])
+        self.assertEqual(STATE["players_by_id"][2]["fighters"], 1000)
+
+    async def test_committing_more_than_aboard_is_rejected(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=50)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        await main.cmd_attack(self.ctx(), "Bob")
+        prompt = await main.cmd_attack_step(self.ctx(), "9999")
+
+        self.assertIn("only have 50", prompt)
+        self.assertIn(PUBKEY, main.PENDING_ATTACKS)          # still pending, retryable
+        self.assertEqual(STATE["defense_log"], [])
+
+    async def test_non_numeric_commit_reprompts_without_firing(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=50)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        await main.cmd_attack(self.ctx(), "Bob")
+        prompt = await main.cmd_attack_step(self.ctx(), "lots")
+
+        self.assertIn("how many", prompt.lower())
+        self.assertIn(PUBKEY, main.PENDING_ATTACKS)
+        self.assertEqual(STATE["attack_events"], [])
+
+    async def test_target_that_left_before_commit_is_handled(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        await main.cmd_attack(self.ctx(), "Bob")
+        STATE["players_by_id"][2]["sector_id"] = 16   # Bob warps off mid-prompt
+
+        prompt = await main.cmd_attack_step(self.ctx(), "100")
+
+        self.assertIn("no longer", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)
+        self.assertEqual(STATE["attack_events"], [])
+
+    async def test_step_with_nothing_pending_is_a_noop(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        prompt = await main.cmd_attack_step(self.ctx(), "100")
+        self.assertIn("No attack in progress", prompt)
+
+    async def test_hit_but_not_destroyed_writes_back_both_ships(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=300, shields=10)
+        STATE["players_by_id"] = {2: self._defender(fighters=1000, shields=200)}
+
+        prompt = await self._aim_and_commit("Bob", "all")
 
         # 300 attackers kill floor(300/0.75)=400 defenders -> 600 left, attacker wiped.
         self.assertIn("You have 0 fighters", prompt)
@@ -1889,27 +2117,33 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(STATE["attack_events"][0]["victim_id"], 2)
 
     async def test_destroying_an_ordinary_ship_ejects_to_an_adjacent_pod(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=2000, shields=10)
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=2000, shields=10)
         STATE["players_by_id"] = {2: self._defender(ship_type="Bismark",
                                                     fighters=1000, shields=200, credits=5000)}
-        main.random = FakeRandom(choice_index=1)   # Sec5 adjacency [4, 6] -> pick 6
+        main.random = FakeRandom(choice_index=1)   # Sec15 adjacency [14, 16] -> pick 16
 
-        prompt = await main.cmd_attack(self.ctx(), "Bob")
+        prompt = await self._aim_and_commit("Bob", "all")
 
         self.assertIn("destroyed Bob's Bismark", prompt)
-        self.assertIn("Sec6", prompt)
+        self.assertIn("slip away", prompt)
+        self.assertNotIn("Sec", prompt)            # pod's destination is NOT revealed
         d = STATE["players_by_id"][2]
         self.assertEqual(d["ship_type"], "Escape Pod")
-        self.assertEqual(d["sector_id"], 6)
-        self.assertEqual(d["credits"], 5000)               # credits survive
+        self.assertEqual(d["sector_id"], 16)       # they really did drift to Sec16...
+        self.assertEqual(d["credits"], 5000)       # ...credits surviving
         self.assertEqual(STATE["attack_events"][0]["outcome"], "destroyed")
+        self.assertEqual(STATE["kills"][-1], {                      # public kill logged
+            "victim_name": "Bob", "killer_name": "Tester",
+            "sector_id": 15, "kind": "ship",
+            "created_at": STATE["kills"][-1]["created_at"],
+        })
 
     async def test_destroying_a_pod_wipes_the_player_back_to_default(self):
-        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=50, shields=10)
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=50, shields=10)
         STATE["players_by_id"] = {2: self._defender(ship_type="Escape Pod",
                                                     fighters=0, shields=0, credits=8000)}
 
-        prompt = await main.cmd_attack(self.ctx(), "Bob")
+        prompt = await self._aim_and_commit("Bob", "all")
 
         self.assertIn("blew apart Bob's escape pod", prompt)
         d = STATE["players_by_id"][2]
@@ -1917,6 +2151,9 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(d["credits"], 20000)               # reset to 20k
         self.assertEqual(d["sector_id"], 1)                 # back at the home sector
         self.assertEqual(STATE["attack_events"][0]["outcome"], "pod_destroyed")
+        self.assertEqual(STATE["kills"][-1]["killer_name"], "Tester")
+        self.assertEqual(STATE["kills"][-1]["victim_name"], "Bob")
+        self.assertEqual(STATE["kills"][-1]["kind"], "pod")
 
 
 class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
@@ -1929,6 +2166,8 @@ class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
         STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["kill_log_cutoff"] = {}
 
     def test_format_lists_each_event_by_outcome_and_time(self):
         events = [
@@ -1979,6 +2218,125 @@ class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Raider destroyed your ship in Sec5", sent[0])
         # The notice rides in front of the actual command's reply.
         self.assertIn("Sec5", sent[0])
+
+
+class KillLogTests(unittest.IsolatedAsyncioTestCase):
+    """The public kill log: formatting, the display cap, and sign-in
+    delivery scoped to everything since the player last signed in."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["kill_log_cutoff"] = {}
+
+    def _kill(self, victim, killer, sector, kind, when):
+        return {"victim_name": victim, "killer_name": killer,
+                "sector_id": sector, "kind": kind, "created_at": when}
+
+    def test_format_renders_combat_and_mine_kills(self):
+        kills = [
+            self._kill("Cleo", "Alice", 9, "pod", "2026-06-27T13:00:00+00:00"),
+            self._kill("Dax", None, 20, "ship", "2026-06-27T14:00:00+00:00"),
+        ]
+        out = main.format_kill_log(kills)
+        self.assertIn("Kills since you last played:", out)
+        self.assertIn("Alice wiped Cleo's escape pod in Sec9", out)
+        self.assertIn("Mines destroyed Dax's ship in Sec20", out)   # None killer -> "Mines"
+        self.assertIn("2026-06-27 14:00 UTC", out)
+
+    def test_format_empty_is_blank(self):
+        self.assertEqual(main.format_kill_log([]), "")
+
+    def test_format_caps_and_notes_the_overflow(self):
+        # One more than the cap: the oldest is dropped and counted.
+        n = main.KILL_LOG_MAX_ENTRIES + 3
+        kills = [self._kill(f"V{i}", "K", i, "ship", f"2026-06-27T12:00:{i:02d}+00:00")
+                 for i in range(n)]
+        out = main.format_kill_log(kills)
+        self.assertIn("(+3 earlier not shown)", out)
+        self.assertNotIn("V0's", out)        # the three oldest are omitted
+        self.assertNotIn("V2's", out)
+        self.assertIn(f"V{n - 1}'s", out)     # the newest is shown
+        # Header + note + exactly the cap's worth of kill lines.
+        self.assertEqual(out.count("\n- "), main.KILL_LOG_MAX_ENTRIES)
+
+    async def _signin(self, text="status"):
+        """Run on_message as a sign-in, returning the first reply sent."""
+        import types as _types
+        import contextlib
+        import io
+
+        sent = []
+
+        async def fake_send_reply(mc, pubkey, sender, text):
+            sent.append(text)
+
+        main.send_reply = fake_send_reply
+
+        class _MC:
+            def get_contact_by_key_prefix(self, pubkey):
+                return {"adv_name": "Tester"}
+
+        event = _types.SimpleNamespace(payload={"pubkey_prefix": PUBKEY, "text": text})
+        with contextlib.redirect_stdout(io.StringIO()):
+            await main.on_message(_MC(), event)
+        return sent[0] if sent else ""
+
+    async def test_signin_shows_only_kills_since_last_signin(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, turns_remaining=50)
+
+        # Two kills happen, then the player establishes a baseline.
+        _stub_record_kill("Bob", "Alice", 42, "ship")
+        _stub_record_kill("Eve", "Frank", 7, "ship")
+        _stub_mark_kill_log_seen(1)            # cutoff now sits after both
+        # Two more happen while they're away.
+        _stub_record_kill("Cleo", "Alice", 9, "pod")
+        _stub_record_kill("Dax", None, 20, "ship")
+
+        reply = await self._signin()
+
+        self.assertIn("Kills since you last played:", reply)
+        self.assertIn("Alice wiped Cleo's escape pod in Sec9", reply)
+        self.assertIn("Mines destroyed Dax's ship in Sec20", reply)
+        self.assertNotIn("Bob", reply)         # pre-baseline kills excluded
+        self.assertNotIn("Eve", reply)
+
+    async def test_signin_advances_cutoff_so_kills_are_not_repeated(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, turns_remaining=50)
+        _stub_record_kill("Cleo", "Alice", 9, "pod")
+        _stub_mark_kill_log_seen(1)            # baseline after the kill -> nothing new
+
+        first = await self._signin()
+        self.assertNotIn("Kills since you last played:", first)  # nothing since baseline
+
+        # A kill lands during their session; next sign-in shows it once...
+        _stub_record_kill("Dax", None, 20, "ship")
+        main.session.ACTIVE_SESSION = None     # they log off
+        second = await self._signin()
+        self.assertIn("Mines destroyed Dax's ship in Sec20", second)
+
+        # ...and not again on a later sign-in with nothing new in between.
+        main.session.ACTIVE_SESSION = None
+        third = await self._signin()
+        self.assertNotIn("Kills since you last played:", third)
+
+    async def test_new_player_baseline_hides_kills_from_before_they_joined(self):
+        # A brand-new player's cutoff is their join time, so kills logged
+        # before that never appear -- the log "begins from when they
+        # signed on". Model that: kills exist, THEN the player's baseline
+        # is set (as create_player does), then they sign in.
+        _stub_record_kill("Bob", "Alice", 42, "ship")   # happened before they joined
+        STATE["player"] = fresh_player(id=1, sector_id=15, turns_remaining=50)
+        _stub_mark_kill_log_seen(1)                      # join baseline (after the kill)
+
+        reply = await self._signin()
+        self.assertNotIn("Kills since you last played:", reply)
+        self.assertNotIn("Bob", reply)
 
 
 class TurnCostTests(unittest.IsolatedAsyncioTestCase):

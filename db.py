@@ -71,9 +71,23 @@ def init_db():
             credits INTEGER NOT NULL DEFAULT 0,
             turns_remaining INTEGER NOT NULL DEFAULT 0,
             last_turn_reset TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            last_kill_log_seen TEXT
         )
     """)
+
+    # Migration for databases created before the public kill log existed:
+    # add the per-player "seen through" cutoff and baseline it to each
+    # player's join date. The kills table starts empty, so there's nothing
+    # to back-fill -- legacy players simply start seeing kills from now on.
+    try:
+        conn.execute("ALTER TABLE players ADD COLUMN last_kill_log_seen TEXT")
+        conn.execute(
+            "UPDATE players SET last_kill_log_seen = created_at "
+            "WHERE last_kill_log_seen IS NULL"
+        )
+    except sqlite3.OperationalError:
+        pass  # already has the column
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ships (
@@ -141,6 +155,26 @@ def init_db():
         "ON attack_events(victim_id, delivered)"
     )
 
+    # Public kill log: a global, append-only record of every ship or escape
+    # pod destroyed -- by combat or by mines. Unlike attack_events (a
+    # private notice for the victim), this is shown to ANY player on
+    # sign-in: every kill newer than their last sign-in
+    # (players.last_kill_log_seen). killer_name is NULL for a mine kill;
+    # kind is 'ship' (a hull blown up, pilot ejected to a pod) or 'pod' (an
+    # escape pod wiped, pilot reset). Names are stored as-of the kill so the
+    # log stays a faithful historical record even if a player renames.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            victim_name TEXT NOT NULL,
+            killer_name TEXT,            -- NULL = killed by mines
+            sector_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,          -- 'ship' or 'pod'
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kills_created ON kills(created_at)")
+
     conn.commit()
     conn.close()
 
@@ -149,6 +183,14 @@ def init_db():
 HOME_SECTOR = 1
 STARTING_CREDITS = 1000
 DAILY_TURNS = 100
+
+# Sectors 1..SAFE_ZONE_MAX_SECTOR are the protected safe zone around the
+# Stardock. It's the single source of truth for that boundary, shared by
+# galaxy generation (which fully interconnects these sectors so the
+# Stardock is always reachable and can't be walled off) and the gameplay
+# rules that forbid laying mines or fighting inside it. New players spawn
+# at the Stardock (HOME_SECTOR) and need a safe runway to get going.
+SAFE_ZONE_MAX_SECTOR = 10
 
 # Turns refill once a day at this hour, Eastern time. America/New_York
 # (rather than a fixed UTC offset) keeps "3am Eastern" correct through
@@ -576,26 +618,32 @@ def get_player_with_ship(pubkey_prefix):
 
 
 def get_players_in_sector(sector_id, exclude_player_id=None):
-    """Names of the players whose current position is `sector_id`, in
-    stable id order. `exclude_player_id` drops one from the list -- the
-    viewer, so they don't see themselves among the ships present. Note
-    this reflects each player's last recorded sector, not whether they're
-    currently online (the game has no online/offline state beyond the
-    single active-session lock), so it includes pilots parked there and
-    logged off."""
+    """Players whose current position is `sector_id`, in stable id order,
+    each as a {"name", "fighters"} dict -- the fighter count is what the
+    sector-info screen advertises so a pilot can size up who they're
+    sharing the sector with before deciding to attack (shields are
+    deliberately NOT included; an opponent's shield strength stays hidden
+    until shots are actually traded). `exclude_player_id` drops one entry
+    -- the viewer, so they don't see themselves among the ships present.
+    Note this reflects each player's last recorded sector, not whether
+    they're currently online (the game has no online/offline state beyond
+    the single active-session lock), so it includes pilots parked there
+    and logged off."""
     conn = get_connection()
-    if exclude_player_id is None:
-        rows = conn.execute(
-            "SELECT name FROM players WHERE sector_id = ? ORDER BY id",
-            (sector_id,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT name FROM players WHERE sector_id = ? AND id != ? ORDER BY id",
-            (sector_id, exclude_player_id)
-        ).fetchall()
+    sql = """
+        SELECT players.name, ships.fighters
+        FROM players
+        JOIN ships ON ships.player_id = players.id
+        WHERE players.sector_id = ?
+    """
+    params = [sector_id]
+    if exclude_player_id is not None:
+        sql += " AND players.id != ?"
+        params.append(exclude_player_id)
+    sql += " ORDER BY players.id"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
-    return [row["name"] for row in rows]
+    return [dict(row) for row in rows]
 
 
 def get_ships_in_sector(sector_id, exclude_player_id=None):
@@ -657,15 +705,78 @@ def pop_attack_events(player_id):
     return events
 
 
+def record_kill(victim_name, killer_name, sector_id, kind):
+    """Append a kill to the public log. `killer_name` is the attacker's
+    display name, or None for a kill by mines. `kind` is 'ship' (a hull
+    destroyed, pilot ejected into a pod) or 'pod' (an escape pod wiped,
+    pilot reset). Names are recorded as given, so the log is a stable
+    historical record."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO kills (victim_name, killer_name, sector_id, kind, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (victim_name, killer_name, sector_id, kind, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_kills_since(cutoff_iso, limit=None):
+    """Public kill-log rows strictly newer than `cutoff_iso` (an ISO-8601
+    UTC timestamp), oldest first, as dicts. A None cutoff returns nothing
+    -- a player with no established baseline hasn't "signed on" yet, so
+    there's no window to report. `limit`, if given, caps the row count."""
+    if cutoff_iso is None:
+        return []
+    conn = get_connection()
+    sql = (
+        "SELECT victim_name, killer_name, sector_id, kind, created_at "
+        "FROM kills WHERE created_at > ? ORDER BY created_at, id"
+    )
+    params = [cutoff_iso]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_kill_log_cutoff(player_id):
+    """The timestamp through which `player_id` has already seen the public
+    kill log -- effectively their last sign-in. Kills newer than this are
+    what they'll be shown next sign-in. None only if the row is missing."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT last_kill_log_seen FROM players WHERE id = ?", (player_id,)
+    ).fetchone()
+    conn.close()
+    return row["last_kill_log_seen"] if row else None
+
+
+def mark_kill_log_seen(player_id):
+    """Advance `player_id`'s kill-log cutoff to now, so the kills they were
+    just shown won't appear again on their next sign-in."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE players SET last_kill_log_seen = ? WHERE id = ?",
+        (now, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def create_player(pubkey_prefix, name):
     """Create a new player + starter ship. Returns the player dict (with ship)."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
 
     cur = conn.execute(
-        """INSERT INTO players (pubkey_prefix, name, sector_id, credits, turns_remaining, last_turn_reset, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (pubkey_prefix, name, HOME_SECTOR, STARTING_CREDITS, DAILY_TURNS, now, now)
+        """INSERT INTO players (pubkey_prefix, name, sector_id, credits, turns_remaining, last_turn_reset, created_at, last_kill_log_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pubkey_prefix, name, HOME_SECTOR, STARTING_CREDITS, DAILY_TURNS, now, now, now)
     )
     player_id = cur.lastrowid
 

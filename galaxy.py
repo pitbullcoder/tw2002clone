@@ -11,7 +11,7 @@ the messages table or any player/ship data (those come later).
 import math
 import random
 
-from db import init_db, get_connection
+from db import init_db, get_connection, SAFE_ZONE_MAX_SECTOR
 
 NUM_SECTORS = 1000
 EXTRA_WARP_EDGES = 1000      # additional undirected edges on top of the spanning tree
@@ -100,6 +100,21 @@ def generate_warps(conn):
         other = random.choice(connected)
         edges.add(tuple(sorted((node, other))))
         connected.append(node)
+
+    # Fully interconnect the Sec1..SAFE_ZONE_MAX_SECTOR safe zone: every
+    # safe-zone sector gets a direct warp to every other, so the Stardock
+    # (Sec1) is always one hop from anywhere in the zone and there's no
+    # internal chokepoint to blockade. Together with the mine/combat bans
+    # inside the zone, this keeps the Stardock approach open -- an enemy
+    # can only mine sectors *outside* the zone and can't wall it off from
+    # within. These edges go in before the random fill below, which then
+    # tops the total up to the usual density (so the overall warp count is
+    # unchanged; the safe-zone clique just displaces some random edges).
+    safe_zone = range(1, SAFE_ZONE_MAX_SECTOR + 1)
+    for a in safe_zone:
+        for b in safe_zone:
+            if a < b:
+                edges.add((a, b))
 
     # Extra random edges for realistic warp density (~4 warps/sector avg).
     attempts = 0

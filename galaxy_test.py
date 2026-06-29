@@ -110,6 +110,26 @@ class GalaxyPortPairingTests(unittest.TestCase):
     def test_home_sector_is_stardock_not_a_commodity_port(self):
         self.assertNotIn(galaxy.HOME_SECTOR, self.ports)
 
+    def test_safe_zone_sectors_are_fully_interconnected(self):
+        # Every pair of sectors in 1..SAFE_ZONE_MAX_SECTOR must warp to each
+        # other (a clique), so the Stardock is always one hop away inside
+        # the zone and can't be walled off. Warps are stored symmetrically,
+        # so check both directions.
+        zone = range(1, galaxy.SAFE_ZONE_MAX_SECTOR + 1)
+        for a in zone:
+            for b in zone:
+                if a == b:
+                    continue
+                self.assertIn(b, self.adjacency.get(a, set()),
+                              f"Sec{a} has no warp to Sec{b} inside the safe zone")
+
+    def test_stardock_reaches_every_safe_zone_sector_directly(self):
+        # A direct consequence worth pinning on its own: the Stardock
+        # (HOME_SECTOR) is adjacent to every other safe-zone sector.
+        neighbors = self.adjacency.get(galaxy.HOME_SECTOR, set())
+        for s in range(2, galaxy.SAFE_ZONE_MAX_SECTOR + 1):
+            self.assertIn(s, neighbors)
+
 
 if __name__ == "__main__":
     unittest.main()

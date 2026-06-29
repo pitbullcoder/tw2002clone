@@ -96,5 +96,116 @@ class TurnDbTests(unittest.TestCase):
         self.assertEqual(self._turns(), 7)  # unchanged
 
 
+class PlayersInSectorTests(unittest.TestCase):
+    """get_players_in_sector against a real db: it reports each present
+    pilot's fighters (what the sector-info screen advertises) but never
+    their shields, in stable id order, and honors exclude_player_id."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "presence.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.executemany("INSERT INTO sectors (id) VALUES (?)", [(1,), (5,)])
+        conn.commit()
+        conn.close()
+
+    def _place(self, pubkey, name, sector_id, fighters, shields):
+        player = db.create_player(pubkey, name)  # starts at the home sector
+        db.move_player_to_sector(player["id"], sector_id)
+        db.set_ship_defenses(player["id"], shields, fighters)
+        return player
+
+    def test_lists_present_pilots_with_fighters_and_no_shields(self):
+        self._place("pk1", "Alice", 5, fighters=10, shields=111)
+        self._place("pk2", "Bob", 5, fighters=20, shields=222)
+        self._place("pk3", "Cleo", 1, fighters=30, shields=333)  # parked elsewhere
+
+        here = db.get_players_in_sector(5)
+
+        self.assertEqual(
+            here,
+            [{"name": "Alice", "fighters": 10}, {"name": "Bob", "fighters": 20}],
+        )
+        # Shields are never part of the row -- they stay hidden.
+        self.assertTrue(all("shields" not in row for row in here))
+
+    def test_exclude_player_id_drops_the_viewer(self):
+        alice = self._place("pk1", "Alice", 5, fighters=10, shields=0)
+        self._place("pk2", "Bob", 5, fighters=20, shields=0)
+
+        here = db.get_players_in_sector(5, exclude_player_id=alice["id"])
+
+        self.assertEqual(here, [{"name": "Bob", "fighters": 20}])
+
+    def test_empty_sector_returns_nothing(self):
+        self.assertEqual(db.get_players_in_sector(5), [])
+
+
+class KillLogDbTests(unittest.TestCase):
+    """record_kill / get_kills_since / cutoff handling against a real db."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "kills.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.execute("INSERT INTO sectors (id) VALUES (1)")
+        conn.commit()
+        conn.close()
+
+    def _insert_kill(self, victim, killer, sector, kind, created_at):
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO kills (victim_name, killer_name, sector_id, kind, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (victim, killer, sector, kind, created_at),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_record_kill_persists_combat_and_mine_kills(self):
+        db.record_kill("Bob", "Alice", 5, "ship")
+        db.record_kill("Cleo", None, 9, "pod")   # None killer = mines
+
+        rows = db.get_kills_since("2000-01-01T00:00:00+00:00")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["victim_name"], rows[0]["killer_name"]), ("Bob", "Alice"))
+        self.assertEqual(rows[0]["kind"], "ship")
+        self.assertIsNone(rows[1]["killer_name"])
+        self.assertEqual((rows[1]["victim_name"], rows[1]["kind"]), ("Cleo", "pod"))
+
+    def test_get_kills_since_filters_by_cutoff_oldest_first(self):
+        self._insert_kill("A", "K", 1, "ship", "2026-06-27T10:00:00+00:00")
+        self._insert_kill("B", "K", 2, "ship", "2026-06-27T12:00:00+00:00")
+        self._insert_kill("C", None, 3, "pod", "2026-06-27T14:00:00+00:00")
+
+        rows = db.get_kills_since("2026-06-27T11:00:00+00:00")
+        self.assertEqual([r["victim_name"] for r in rows], ["B", "C"])  # A excluded, ordered
+
+    def test_get_kills_since_none_returns_empty(self):
+        self._insert_kill("A", "K", 1, "ship", "2026-06-27T10:00:00+00:00")
+        self.assertEqual(db.get_kills_since(None), [])
+
+    def test_get_kills_since_respects_limit(self):
+        for i in range(5):
+            self._insert_kill(f"V{i}", "K", i, "ship", f"2026-06-27T1{i}:00:00+00:00")
+        rows = db.get_kills_since("2000-01-01T00:00:00+00:00", limit=2)
+        self.assertEqual([r["victim_name"] for r in rows], ["V0", "V1"])  # oldest two
+
+    def test_new_player_cutoff_is_their_join_time(self):
+        player = db.create_player("pk", "Alice")
+        cutoff = db.get_kill_log_cutoff(player["id"])
+        self.assertIsNotNone(cutoff)
+        # A kill from long before they joined never shows.
+        self._insert_kill("Old", "K", 1, "ship", "2000-01-01T00:00:00+00:00")
+        self.assertEqual(db.get_kills_since(cutoff), [])
+
+    def test_mark_kill_log_seen_advances_the_cutoff(self):
+        player = db.create_player("pk", "Alice")
+        before = db.get_kill_log_cutoff(player["id"])
+        db.mark_kill_log_seen(player["id"])
+        after = db.get_kill_log_cutoff(player["id"])
+        self.assertGreaterEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()

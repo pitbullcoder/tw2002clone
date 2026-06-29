@@ -64,8 +64,11 @@ def build_sector_info(sector_id, viewer_id=None):
 
     `viewer_id` is the player looking (so they're left out of the ship
     list below). When other pilots are parked in the sector, a final
-    "Ships here:" line names them; it's omitted entirely when the sector
-    is empty of other ships, so a solo sector reads exactly as before.
+    "Ships here:" line names them and how many fighters each is flying
+    (e.g. "Bob (1000 ftr)") so a pilot can weigh an attack; shields are
+    deliberately left off, so an opponent's shield strength stays unknown
+    until combat. The line is omitted entirely when the sector is empty of
+    other ships, so a solo sector reads exactly as before.
     """
     lines = [
         f"Sec{sector_id}",
@@ -74,5 +77,6 @@ def build_sector_info(sector_id, viewer_id=None):
     ]
     others = get_players_in_sector(sector_id, viewer_id)
     if others:
-        lines.append("Ships here: " + ", ".join(others))
+        listed = ", ".join(f"{o['name']} ({o['fighters']} ftr)" for o in others)
+        lines.append("Ships here: " + listed)
     return "\n".join(lines)

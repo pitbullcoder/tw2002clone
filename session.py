@@ -8,7 +8,7 @@ slow reply, so we time it out either way).
 import asyncio
 import time
 
-from core import PENDING_TRADES, PENDING_WARPS, PENDING_UPGRADES
+from core import PENDING_TRADES, PENDING_WARPS, PENDING_UPGRADES, PENDING_ATTACKS
 from messaging import send_reply
 
 
@@ -57,13 +57,14 @@ def _touch_session(pubkey):
 
 def _release_session(pubkey):
     """Free the lock if pubkey currently holds it, and drop any
-    trade/warp state they had in progress -- that state only makes sense
-    mid-session, and leaving it around would let a *later* session for
-    the same pubkey resume a stale trade unexpectedly."""
+    trade/warp/attack state they had in progress -- that state only makes
+    sense mid-session, and leaving it around would let a *later* session
+    for the same pubkey resume a stale flow unexpectedly."""
     global ACTIVE_SESSION
     PENDING_TRADES.pop(pubkey, None)
     PENDING_WARPS.pop(pubkey, None)
     PENDING_UPGRADES.pop(pubkey, None)
+    PENDING_ATTACKS.pop(pubkey, None)
     if ACTIVE_SESSION and ACTIVE_SESSION["pubkey"] == pubkey:
         ACTIVE_SESSION = None
 
