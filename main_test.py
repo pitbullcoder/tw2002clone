@@ -299,9 +299,65 @@ SHIP_CATALOG = {
         "base_probes": 0,
         "max_probes": 10,
     },
+    "Kestrel": {
+        "classification": "Corvette",
+        "price": 8000,
+        "base_holds": 15,
+        "base_fighters": 20,
+        "base_shields": 20,
+        "base_mines": 0,
+        "max_holds": 40,
+        "max_fighters": 120,
+        "max_shields": 150,
+        "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 25,
+    },
+    "Mule": {
+        "classification": "Fleet Tender",
+        "price": 40000,
+        "base_holds": 40,
+        "base_fighters": 0,
+        "base_shields": 30,
+        "base_mines": 0,
+        "max_holds": 120,
+        "max_fighters": 5,
+        "max_shields": 250,
+        "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 10,
+    },
+    "Barracuda": {
+        "classification": "Destroyer",
+        "price": 120000,
+        "base_holds": 20,
+        "base_fighters": 120,
+        "base_shields": 150,
+        "base_mines": 0,
+        "max_holds": 60,
+        "max_fighters": 900,
+        "max_shields": 1200,
+        "max_mines": 20,
+        "base_probes": 0,
+        "max_probes": 15,
+    },
+    "Nautilus": {
+        "classification": "Minelayer",
+        "price": 180000,
+        "base_holds": 25,
+        "base_fighters": 40,
+        "base_shields": 120,
+        "base_mines": 10,
+        "max_holds": 80,
+        "max_fighters": 400,
+        "max_shields": 1000,
+        "max_mines": 150,
+        "base_probes": 0,
+        "max_probes": 15,
+    },
     "SS Endeavour": {
         "classification": "Merchant Freighter",
-        "price": 20000,
+        "price": 200000,
         "base_holds": 50,
         "base_fighters": 0,
         "base_shields": 50,
@@ -313,9 +369,37 @@ SHIP_CATALOG = {
         "base_probes": 0,
         "max_probes": 10,
     },
+    "Hornet": {
+        "classification": "Fleet Carrier",
+        "price": 350000,
+        "base_holds": 15,
+        "base_fighters": 400,
+        "base_shields": 100,
+        "base_mines": 0,
+        "max_holds": 50,
+        "max_fighters": 3000,
+        "max_shields": 800,
+        "max_mines": 0,
+        "base_probes": 0,
+        "max_probes": 20,
+    },
+    "Vanguard": {
+        "classification": "Battlecruiser",
+        "price": 450000,
+        "base_holds": 20,
+        "base_fighters": 150,
+        "base_shields": 600,
+        "base_mines": 0,
+        "max_holds": 70,
+        "max_fighters": 1500,
+        "max_shields": 5000,
+        "max_mines": 30,
+        "base_probes": 0,
+        "max_probes": 20,
+    },
     "Bismark": {
         "classification": "Capital Ship",
-        "price": 23500,
+        "price": 500000,
         "base_holds": 30,
         "base_fighters": 200,
         "base_shields": 500,
@@ -1058,13 +1142,20 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
             prompt,
         )
         self.assertIn(
-            "2) SS Endeavour (Merchant Freighter): 200 holds / 10 fighters / 400 shields -- 20000cr",
+            "2) Kestrel (Corvette): 40 holds / 120 fighters / 150 shields -- 8000cr",
             prompt,
         )
-        # Bismark has a mine bay -- its line should include mine
-        # capacity, unlike the other two hulls which have none.
         self.assertIn(
-            "3) Bismark (Capital Ship): 125 holds / 2000 fighters / 3500 shields / 50 mines -- 23500cr",
+            "6) SS Endeavour (Merchant Freighter): 200 holds / 10 fighters / 400 shields -- 200000cr",
+            prompt,
+        )
+        # Any hull with a mine bay shows mine capacity, not just the Bismark.
+        self.assertIn(
+            "5) Nautilus (Minelayer): 80 holds / 400 fighters / 1000 shields / 150 mines -- 180000cr",
+            prompt,
+        )
+        self.assertIn(
+            "9) Bismark (Capital Ship): 125 holds / 2000 fighters / 3500 shields / 50 mines -- 500000cr",
             prompt,
         )
         # Flying the free default ship -- nothing to trade in, so no sell line.
@@ -1072,18 +1163,18 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
 
     async def test_buying_the_bismark_full_flow(self):
-        STATE["player"] = fresh_player(credits=30000, ship_type="Falcon")
+        STATE["player"] = fresh_player(credits=600000, ship_type="Falcon")
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        prompt = await self.say("3")  # Bismark
+        prompt = await self.say("9")  # Bismark
         self.assertIn(
-            "Trade in your Falcon (0cr) for a Bismark (23500cr)? Net cost: 23500cr. yes/no",
+            "Trade in your Falcon (0cr) for a Bismark (500000cr)? Net cost: 500000cr. yes/no",
             prompt,
         )
 
         prompt = await self.say("yes")
-        self.assertIn("Welcome aboard the Bismark! -23500cr (net).", prompt)
+        self.assertIn("Welcome aboard the Bismark! -500000cr (net).", prompt)
         # Back at the top-level menu, now with Mines and Probes refit
         # options, so Shipyard sits at #6 (Falcon only reached #5).
         self.assertIn("Cargo Holds 30/125 @ 500cr each", prompt)
@@ -1099,22 +1190,22 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["fighters"], 200)
         self.assertEqual(final["shields"], 500)
         self.assertEqual(final["mines"], 0)
-        self.assertEqual(final["credits"], 30000 - 23500)
-        self.assertEqual(STATE["ship_log"], [("Bismark", 30, 200, 500, 0, -23500)])
+        self.assertEqual(final["credits"], 600000 - 500000)
+        self.assertEqual(STATE["ship_log"], [("Bismark", 30, 200, 500, 0, -500000)])
 
     async def test_buying_a_new_ship_full_flow(self):
-        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["player"] = fresh_player(credits=250000, ship_type="Falcon")
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        prompt = await self.say("2")  # SS Endeavour
+        prompt = await self.say("6")  # SS Endeavour
         self.assertIn(
-            "Trade in your Falcon (0cr) for a SS Endeavour (20000cr)? Net cost: 20000cr. yes/no",
+            "Trade in your Falcon (0cr) for a SS Endeavour (200000cr)? Net cost: 200000cr. yes/no",
             prompt,
         )
 
         prompt = await self.say("yes")
-        self.assertIn("Welcome aboard the SS Endeavour! -20000cr (net).", prompt)
+        self.assertIn("Welcome aboard the SS Endeavour! -200000cr (net).", prompt)
         self.assertIn("Stardock refits:", prompt)  # back at the top-level menu
         self.assertIn("Cargo Holds 50/200 @ 500cr each", prompt)  # new ship's caps
 
@@ -1123,8 +1214,8 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["holds_total"], 50)
         self.assertEqual(final["fighters"], 0)
         self.assertEqual(final["shields"], 50)
-        self.assertEqual(final["credits"], 25000 - 20000)
-        self.assertEqual(STATE["ship_log"], [("SS Endeavour", 50, 0, 50, 0, -20000)])
+        self.assertEqual(final["credits"], 250000 - 200000)
+        self.assertEqual(STATE["ship_log"], [("SS Endeavour", 50, 0, 50, 0, -200000)])
         self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "menu")  # visit stays open
 
     async def test_selling_current_ship_returns_to_falcon(self):
@@ -1135,32 +1226,32 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.enter_shipyard()
         prompt = await self.say("s")
         self.assertIn(
-            "Sell your SS Endeavour and return to the Falcon for 10000cr? yes/no",
+            "Sell your SS Endeavour and return to the Falcon for 100000cr? yes/no",
             prompt,
         )
 
         prompt = await self.say("yes")
-        self.assertIn("Sold your old ship. Welcome back to the Falcon. +10000cr.", prompt)
+        self.assertIn("Sold your old ship. Welcome back to the Falcon. +100000cr.", prompt)
 
         final = STATE["player"]
         self.assertEqual(final["ship_type"], "Falcon")
         self.assertEqual(final["holds_total"], 20)
         self.assertEqual(final["fighters"], 10)
         self.assertEqual(final["shields"], 10)
-        self.assertEqual(final["credits"], 5000 + 10000)
-        self.assertEqual(STATE["ship_log"], [("Falcon", 20, 10, 10, 0, 10000)])
+        self.assertEqual(final["credits"], 5000 + 100000)
+        self.assertEqual(STATE["ship_log"], [("Falcon", 20, 10, 10, 0, 100000)])
 
     async def test_ship_swap_clears_cargo(self):
         """Cargo doesn't transfer between hulls -- swapping (buy or
         sell) empties whatever was in the hold."""
         STATE["player"] = fresh_player(
-            credits=25000, ship_type="Falcon",
+            credits=250000, ship_type="Falcon",
             fuel_ore=5, organics=3, equipment=2,
         )
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        await self.say("2")     # SS Endeavour
+        await self.say("6")     # SS Endeavour
         await self.say("yes")
 
         final = STATE["player"]
@@ -1184,7 +1275,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        prompt = await self.say("2")  # SS Endeavour, which they already fly
+        prompt = await self.say("6")  # SS Endeavour, which they already fly
 
         self.assertIn("You already own the SS Endeavour.", prompt)
         self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
@@ -1194,10 +1285,10 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        prompt = await self.say("2")  # SS Endeavour @ 20000cr net
+        prompt = await self.say("6")  # SS Endeavour @ 200000cr net
 
         self.assertIn(
-            "Can't afford the SS Endeavour -- net cost 20000cr (20000cr less a 0cr trade-in), "
+            "Can't afford the SS Endeavour -- net cost 200000cr (200000cr less a 0cr trade-in), "
             "you have 100cr.",
             prompt,
         )
@@ -1205,11 +1296,11 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(STATE["ship_log"], [])
 
     async def test_declining_purchase_confirm_returns_to_shipyard_menu_unchanged(self):
-        STATE["player"] = fresh_player(credits=25000, ship_type="Falcon")
+        STATE["player"] = fresh_player(credits=250000, ship_type="Falcon")
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        await self.say("2")
+        await self.say("6")
         prompt = await self.say("no")
 
         self.assertIn("Shipyard:", prompt)
@@ -1241,9 +1332,10 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
     """
     Covers the Mines refit stat and its per-ship visibility: only a hull
-    with a mine bay (max_mines > 0, i.e. the Bismark) offers it in the
-    Stardock menu. Falcon/SS Endeavour have none, so the menu -- and the
-    Shipyard option's numbering -- should never mention it for them.
+    with a mine bay (max_mines > 0 -- the Bismark, Barracuda, Nautilus,
+    and Vanguard) offers it in the Stardock menu. Hulls with none (e.g.
+    Falcon/SS Endeavour) don't, so the menu -- and the Shipyard option's
+    numbering -- should never mention it for them.
     """
 
     def setUp(self):
@@ -1647,9 +1739,9 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         prompt = await main.cmd_stardock_step(self.ctx(), "")  # re-show shipyard menu
 
         self.assertIn("1) Falcon", prompt)
-        self.assertIn("2) SS Endeavour", prompt)
-        self.assertIn("3) Bismark", prompt)
-        self.assertNotIn("4)", prompt)                     # pod not a buy option
+        self.assertIn("9) Bismark", prompt)                # all 9 hulls listed
+        self.assertNotIn("10)", prompt)                    # ...and nothing past them
+        self.assertNotIn(") Escape Pod (", prompt)         # pod is never a buy option
         self.assertIn("Sell your Escape Pod", prompt)      # but can be traded back in
 
 

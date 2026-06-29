@@ -1,7 +1,8 @@
 # tw2002clone
 
 A multiplayer space trading-and-combat game inspired by the classic
-**TradeWars 2002** BBS door game, played entirely over a **MeshCore radio mesh** — no internet required. Players pilot a ship through
+**TradeWars 2002** BBS door game, played entirely over a **MeshCore /
+Meshtastic radio mesh** — no internet required. Players pilot a ship through
 a 1000-sector galaxy by sending short text messages to the game's radio
 node; the bot replies over the same mesh. It's built to run on a Raspberry
 Pi or any Linux machine attached to a MeshCore radio, so a whole game can
@@ -72,14 +73,29 @@ item.
 
 ### Ships & the Stardock
 
-Three buyable hulls, plus the pod you can't buy:
+Nine buyable hulls, plus the escape pod you can't buy. Prices climb with
+capability, but the heavy hulls are **sidegrades, not strict upgrades** —
+each specializes in something (fighters, shields, mines, or cargo), so the
+"best" ship depends on how you play. Figures below are each hull's **maximum
+upgradeable capacity**.
 
-| Ship          | Class             | Price    | Notes                                              |
-|---------------|-------------------|----------|----------------------------------------------------|
-| **Falcon**    | Frigate           | free     | The starter ship; balanced, no mine bay.           |
-| **SS Endeavour** | Merchant Freighter | 20,000 | Big cargo holds, weak guns — a hauler.             |
-| **Bismark**   | Capital Ship      | 1        | Heavy fighters/shields; the **only ship with a mine bay** (up to 50 mines). |
-| *Escape Pod*  | Escape Pod        | n/a      | Where you end up when your ship is destroyed. Not for sale. |
+| Ship | Class | Price | Holds | Fighters | Shields | Mines | Probes | Role |
+|------|-------|------:|------:|---------:|--------:|------:|-------:|------|
+| **Falcon** | Frigate | free | 75 | 50 | 200 | — | 10 | The free starter; balanced all-rounder. |
+| **Kestrel** | Corvette | 8,000 | 40 | 120 | 150 | — | 25 | Cheap, nimble scout — best probe range in the fleet. |
+| **Mule** | Fleet Tender | 40,000 | 120 | 5 | 250 | — | 10 | Entry-level hauler; lots of cargo, almost no guns. |
+| **Barracuda** | Destroyer | 120,000 | 60 | 900 | 1,200 | 20 | 15 | Aggressive mid-tier warship with a small mine bay. |
+| **Nautilus** | Minelayer | 180,000 | 80 | 400 | 1,000 | 150 | 15 | Mine specialist — the biggest mine bay anywhere; starts with 10 mines. |
+| **SS Endeavour** | Merchant Freighter | 200,000 | 200 | 10 | 400 | — | 10 | Serious cargo hauler; weak guns. |
+| **Hornet** | Fleet Carrier | 350,000 | 50 | 3,000 | 800 | — | 20 | Fighter glass-cannon: out-guns everything, thin shields. |
+| **Vanguard** | Battlecruiser | 450,000 | 70 | 1,500 | 5,000 | 30 | 20 | Shield tank: the toughest hull to crack. |
+| **Bismark** | Capital Ship | 500,000 | 125 | 2,000 | 3,500 | 50 | 20 | The flagship all-rounder — strong everywhere. |
+| *Escape Pod* | Escape Pod | n/a | — | — | — | — | — | Where you end up when your ship is destroyed. Not for sale. |
+
+Several hulls — the **Barracuda, Nautilus, Vanguard, and Bismark** — carry a
+**mine bay**; the others can't lay mines at all. Ships start with base stats
+well below these maximums and are upgraded toward them at the Stardock (the
+Nautilus is the one hull that comes with mines already aboard).
 
 Ship stats and prices (and most other balance numbers) live in
 `SHIP_CATALOG` in `db.py`, so they're easy to tune for your own game.
@@ -118,7 +134,8 @@ At the **Stardock** (Sector 1) you can:
 
 ### Mines
 
-* Only a **Bismark** can carry and lay mines. Lay them with `lay <n>`.
+* Only ships with a **mine bay** (the Barracuda, Nautilus, Vanguard, and
+  Bismark) can carry and lay mines. Lay them with `lay <n>`.
 * **No mines may be laid in the safe zone (Sectors 1–10).**
 * When a pilot enters a sector holding mines that aren't their own, **all of
   them detonate at once**. Each mine does 1–10 damage, which cascades
@@ -162,7 +179,7 @@ Send these as direct messages to the game node.
 | *(number)* | | Move to that sector (plots a route if it isn't adjacent). |
 | `p`     | `port` | Dock to trade, or to refit / visit the shipyard at a Stardock. |
 | `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). |
-| `lay <n>` | `mine <n>` | Lay `n` mines in your current sector (Bismark only). |
+| `lay <n>` | `mine <n>` | Lay `n` mines in your current sector (needs a ship with a mine bay). |
 | `probe <n>` | | Send a recon probe to scout a route to sector `n`. |
 | `combat`| | Show the combat & recon sub-menu. |
 | `quit`  | `logout` | Sign off so another player can take a turn. |
