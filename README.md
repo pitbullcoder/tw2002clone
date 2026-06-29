@@ -1,31 +1,309 @@
 # tw2002clone
-A Project Inspired by TradeWars 2002 BBS Game for MeshCore
 
-# Setup
-You will need to install Python3 in order to host the project. I also assume you have a MeshCore radio flashed with a USB Companion software. 
-## One time setup steps for dependencies: <br/>
-Open the python virtual environment: <br><br>
-python3 -m venv venv<br>
+A multiplayer space trading-and-combat game inspired by the classic
+**TradeWars 2002** BBS door game, played entirely over a **MeshCore radio mesh** — no internet required. Players pilot a ship through
+a 1000-sector galaxy by sending short text messages to the game's radio
+node; the bot replies over the same mesh. It's built to run on a Raspberry
+Pi or any Linux machine attached to a MeshCore radio, so a whole game can
+live on a single low-power node out in the field.
+
+Think of it as a persistent, off-grid BBS door: buy low and sell high
+between star ports, upgrade your ship, lay mine fields, hunt other pilots,
+and try not to get your hull blown out from under you.
+
+---
+
+## How you play
+
+You interact with the game by sending it **direct messages** over the mesh
+(the same way you'd DM any other node). Each message is a command; the bot
+runs it and replies. A short menu is always a `menu` away.
+
+Because a mesh link is slow and only one conversation can sensibly happen at
+a time, the game uses a **single "at the helm" lock**: one player holds the
+controls, and others are politely asked to wait their turn. If the active
+player goes quiet (radio out of range, app closed, walked away), they're
+warned and then automatically signed off so the next pilot can play.
+
+All replies are automatically split into radio-sized chunks (≤130
+characters) and sent one at a time, waiting for each to be acknowledged
+before the next goes out.
+
+---
+
+## Features & mechanics
+
+### The galaxy
+
+* **1000 sectors** connected by two-way **warps**, generated as a
+  fully-connected network (every sector is reachable from any other).
+* About **20% of sectors have a port**. Most ports trade commodities; one
+  special **Stardock** sits at the home sector (Sector 1).
+* **Complementary port pairs**: at least 5% of ports are placed as adjacent
+  pairs where one buys exactly what the other sells, giving traders a
+  reliable shuttle run for profit.
+* **Safe zone (Sectors 1–10)**: these sectors are **fully interconnected**
+  (every one warps directly to every other, so the Stardock can't be walled
+  off), and they're protected — **no mines and no combat** are allowed
+  inside. New pilots get a safe runway to find their feet.
+
+### Turns & time
+
+* You start with **1000 credits**, a free **Falcon**, and **100 turns**.
+* **Each sector you move into costs one turn.** Trading, docking, scanning,
+  and fighting are free.
+* Turns **refill to 100 once a day at 3:00 AM Eastern** (daylight-saving
+  aware). The refill is checked when you sign in.
+* Being relocated by *someone else's* attack (or a mine) never costs you a
+  turn.
+
+### Trading & ports
+
+Commodities are **fuel ore, organics, and equipment**. Each commodity port
+is one of eight classes describing, per commodity, whether the port **buys
+from you** or **sells to you**. Selling prices are deliberately set below
+buying prices across the galaxy, so shuttling goods between complementary
+ports yields a margin instead of relying on luck.
+
+Dock with `p` (port). Trading is a **guided sell-then-buy flow**: the port
+walks you through each commodity, your free cargo holds are recalculated
+after every transaction, and you can `cancel` at any point or skip a single
+item.
+
+### Ships & the Stardock
+
+Three buyable hulls, plus the pod you can't buy:
+
+| Ship          | Class             | Price    | Notes                                              |
+|---------------|-------------------|----------|----------------------------------------------------|
+| **Falcon**    | Frigate           | free     | The starter ship; balanced, no mine bay.           |
+| **SS Endeavour** | Merchant Freighter | 20,000 | Big cargo holds, weak guns — a hauler.             |
+| **Bismark**   | Capital Ship      | 1        | Heavy fighters/shields; the **only ship with a mine bay** (up to 50 mines). |
+| *Escape Pod*  | Escape Pod        | n/a      | Where you end up when your ship is destroyed. Not for sale. |
+
+Ship stats and prices (and most other balance numbers) live in
+`SHIP_CATALOG` in `db.py`, so they're easy to tune for your own game.
+
+At the **Stardock** (Sector 1) you can:
+
+* **Refit** your current ship — buy extra cargo holds, fighters, and shields
+  up to that hull's maximums.
+* Visit the **shipyard** to buy a different hull or sell your current one.
+* Buy **probes** (recon drones) for scouting.
+
+### Navigation
+
+* Type a **sector number** to move. Adjacent sectors are a single warp.
+* For a distant sector, the game **plots the shortest route** through the
+  warp network and walks you hop-by-hop, asking you to confirm each jump.
+* You can **dock mid-route** (`p`) — trade or refit at a port you pass
+  through — and then continue the same plotted course without re-plotting.
+
+### Combat
+
+* Attack another pilot in your sector with `a <name>` (or just `a` if only
+  one other ship is present). Combat is **not allowed in the safe zone
+  (Sectors 1–10)**.
+* You're asked **how many fighters to commit** — send a number, `all`, or
+  `cancel`. Fighters you hold back are never at risk.
+* Resolution: your fighters clash with the defender's first (you spend
+  ~0.75 of a fighter per enemy fighter destroyed); any survivors then strip
+  **shields** (about 10 shields per leftover fighter). A ship is destroyed
+  only when **both** its fighters and shields are gone.
+* The **sector info screen shows other ships' fighter counts but never
+  their shields** — you can size up a target's firepower, but their shield
+  strength stays hidden until you actually trade shots.
+* When you destroy a ship, the pilot ejects into an escape pod and drifts
+  off — **you are not told where they went.** They have to be hunted down.
+
+### Mines
+
+* Only a **Bismark** can carry and lay mines. Lay them with `lay <n>`.
+* **No mines may be laid in the safe zone (Sectors 1–10).**
+* When a pilot enters a sector holding mines that aren't their own, **all of
+  them detonate at once**. Each mine does 1–10 damage, which cascades
+  through shields, then fighters, then the hull.
+* Your own mines never detonate on you.
+
+### Death, escape pods & resets
+
+* A destroyed **ship** ejects its pilot into an **Escape Pod**, which drifts
+  4–6 warps away. Cargo and the hull are lost; **credits are kept**.
+* Finishing off someone who's **already in a pod** — or running a pod into a
+  mine field — is a **total reset**: back to a fresh Falcon at the Stardock
+  with credits reset to 20,000. A pod has no defenses, so it's fragile.
+* A pilot flying a pod can trade it in for the free Falcon at any Stardock —
+  the intended way to climb back out.
+
+### The public kill log
+
+When you sign in, you're shown a **public log of every kill since you last
+played** — both player-vs-player combat kills and kills by mines. Brand-new
+players only see kills from when they first joined onward. (The most recent
+entries are shown, with a count of any older ones, to keep it radio-sized.)
+
+### While-you-were-away notices
+
+Separately from the public log, if you personally were attacked or destroyed
+while signed off, you get a private briefing of what happened to you the next
+time you sign in.
+
+---
+
+## Command reference
+
+Send these as direct messages to the game node.
+
+| Command | Aliases | What it does |
+|---------|---------|--------------|
+| `menu`  | `help`, `?` | List commands (`help combat` for the combat sub-menu). |
+| `info`  | `i` | Show your current sector: port, warps, and other ships present. |
+| `status`| `st` | Show your credits, sector, ship, and turns remaining. |
+| *(number)* | | Move to that sector (plots a route if it isn't adjacent). |
+| `p`     | `port` | Dock to trade, or to refit / visit the shipyard at a Stardock. |
+| `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). |
+| `lay <n>` | `mine <n>` | Lay `n` mines in your current sector (Bismark only). |
+| `probe <n>` | | Send a recon probe to scout a route to sector `n`. |
+| `combat`| | Show the combat & recon sub-menu. |
+| `quit`  | `logout` | Sign off so another player can take a turn. |
+
+---
+
+## Setup & hosting (Raspberry Pi / Linux)
+
+### What you need
+
+* A **Raspberry Pi or Linux machine** (anything that runs Python 3.9+).
+* A **MeshCore radio** flashed with the **USB Companion** firmware,
+  connected to the host over USB.
+* **Python 3** with `venv`, and the **`meshcore`** Python package.
+
+### 1. Serial port & permissions
+
+The bot connects to the radio over a USB serial device. By default it
+expects **`/dev/ttyACM0` at 115200 baud** (see the `MeshCore.create_serial`
+call near the bottom of `main.py`). Plug in the radio and confirm the device:
+
+```bash
+ls /dev/ttyACM* /dev/ttyUSB*    # find your radio's device node
+```
+
+If it shows up as something other than `/dev/ttyACM0` (e.g. `/dev/ttyUSB0`),
+edit that line in `main.py` to match.
+
+On most Linux distros / Raspberry Pi OS you also need permission to read the
+serial port. Add your user to the `dialout` group once, then log out and
+back in (or reboot):
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+### 2. Time zone data
+
+Turn resets happen at 3:00 AM **Eastern**, which relies on the system time
+zone database. Minimal images sometimes lack it:
+
+```bash
+sudo apt install tzdata     # Debian / Raspberry Pi OS
+# or, inside the venv: pip install tzdata
+```
+
+### 3. Install dependencies
+
+```bash
+python3 -m venv venv
 source venv/bin/activate
-<br><br>
-Next install project dependencies: <br><br>
 pip install meshcore
-<br><br>
-You will want to generate a galaxy prior to launching main.py. So start with this: 
-<br><br>
-python3 -m venv venv <br/>
-source venv/bin/activate <br/>
-python galaxy.py <br/>
+```
 
-# Startup
-python3 -m venv venv <br/>
-source venv/bin/activate <br/>
-python main.py <br/>
+(Re-run `source venv/bin/activate` in any new shell before using the tools
+below.)
 
-# Testing
-I started some unit tests. To run them: <br/><br/>
-python3 -m venv venv <br/>
-source venv/bin/activate <br/>
-python main_test.py <br/>
+### 4. Generate the galaxy (one time)
 
+This builds the sectors, warps, and ports. Run it **before** the first
+launch:
 
+```bash
+source venv/bin/activate
+python galaxy.py
+```
+
+> ⚠️ Re-running `galaxy.py` **wipes and regenerates** the entire map. Players
+> keep their credits, cargo, and ship, but the whole port/warp layout
+> changes. It prompts for confirmation first.
+
+### 5. Run the game
+
+```bash
+source venv/bin/activate
+python main.py
+```
+
+You should see `Connected OK` and then `Bot is running...`. The game now
+listens for player messages over the mesh. All player and game data is
+stored in a local SQLite file (`meshcore_messages.db`) in the project
+directory.
+
+### Keeping it running
+
+`main.py` is a long-lived process, so on a headless Pi you'll want it to
+survive your SSH session. The simplest option is a terminal multiplexer:
+
+```bash
+sudo apt install tmux
+tmux new -s tw2002
+source venv/bin/activate && python main.py
+# detach with Ctrl-b then d; reattach later with: tmux attach -t tw2002
+```
+
+For an always-on node, a small **systemd** service that runs
+`venv/bin/python main.py` from the project directory (with
+`Restart=on-failure`) works well and will start the game on boot.
+
+---
+
+## Testing
+
+The project ships with unit and integration tests. The main suite stubs out
+the database for fast, isolated tests; the `db` and `galaxy` suites run
+against a throwaway SQLite file.
+
+```bash
+source venv/bin/activate
+python main_test.py      # game logic (commands, combat, navigation, kill log, ...)
+python db_test.py        # database-level behavior (turns, kill log, presence)
+python galaxy_test.py    # galaxy generation (port pairs, safe-zone connectivity)
+```
+
+The codebase is kept clean under [pyflakes](https://pypi.org/project/pyflakes/):
+
+```bash
+pip install pyflakes
+python -m pyflakes *.py
+```
+
+---
+
+## Project layout
+
+The game is split into focused modules:
+
+| Module | Responsibility |
+|--------|----------------|
+| `main.py` | Entry point, radio wiring, command handlers, sign-in flow. |
+| `core.py` | Shared game state, the command registry, and the message context. |
+| `db.py` | SQLite schema, all persistence, and the game-balance constants. |
+| `galaxy.py` | One-time generation of sectors, warps, and ports. |
+| `trading.py` | Port trading and the Stardock refit / shipyard flows. |
+| `combat.py` | Pure combat & mine-damage math (no database access). |
+| `pathfinding.py` | Warp-graph routing and escape-pod placement. |
+| `display.py` | Rendering sector info and menus into text screens. |
+| `messaging.py` | Splitting replies into radio chunks and the send/ack transport. |
+| `session.py` | The single-player "at the helm" lock and inactivity timeout. |
+| `*_test.py` | The test suites described above. |
+
+---
+
+*Inspired by TradeWars 2002. Built for MeshCore as a hobby project.*
