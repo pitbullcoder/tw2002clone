@@ -38,6 +38,13 @@ PENDING_UPGRADES = {}
 PENDING_ATTACKS = {}
 
 
+# pubkey -> dict {"station_id":, "stage":, ...} tracking an in-progress
+# visit to a player's own space station (deposit materials, transfer
+# fighters, toggle shields, set posture, upgrade). Populated by
+# cmd_station, advanced by cmd_station_step.
+PENDING_STATIONS = {}
+
+
 # Map of command -> (description, async handler(ctx, args) -> str)
 COMMANDS = {}
 

@@ -77,6 +77,11 @@ STATE = {
     # the timestamp through which they've seen the log (their last sign-in).
     "kills": [],
     "kill_log_cutoff": {},
+    # Space-station fixtures: id -> station dict. _stub_create_station
+    # assigns ids from next_station_id. Empty by default so the info screen
+    # and enter_sector show/run no station logic unless a test sets one.
+    "stations": {},
+    "next_station_id": 1,
 }
 
 
@@ -433,6 +438,32 @@ SHIP_RESALE_FRACTION = 0.5
 HOME_SECTOR = 1
 SAFE_ZONE_MAX_SECTOR = 10
 
+# Station constants/helpers mirrored from db (pure -- no persistence).
+STATION_CORE_PRICE = 5_000_000
+STATION_CORE_HOLDS = 150
+STATION_MAX_LEVEL = 4
+STATION_LEVEL_CAPS = {
+    1: {"max_shields": 1000, "max_fighters": 1000},
+    2: {"max_shields": 2500, "max_fighters": 2500},
+    3: {"max_shields": 5000, "max_fighters": 5000},
+    4: {"max_shields": 10000, "max_fighters": 10000},
+}
+STATION_UPGRADES = {
+    2: {"credits": 10_000_000, "fuel": 2500, "organics": 2000, "equipment": 1000, "days": 5},
+    3: {"credits": 12_500_000, "fuel": 3500, "organics": 2500, "equipment": 1750, "days": 8},
+    4: {"credits": 15_000_000, "fuel": 5000, "organics": 3500, "equipment": 2000, "days": 12},
+}
+SHIELD_FUEL_BURN_PER_SHIELD = 0.1
+
+
+def station_caps(level):
+    caps = STATION_LEVEL_CAPS[level]
+    return caps["max_shields"], caps["max_fighters"]
+
+
+def station_daily_fuel_burn(level):
+    return round(SHIELD_FUEL_BURN_PER_SHIELD * station_caps(level)[0])
+
 
 def _stub_sell_value(ship_type):
     return round(SHIP_CATALOG[ship_type]["price"] * SHIP_RESALE_FRACTION)
@@ -453,6 +484,108 @@ def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, 
     player["organics"] = 0
     player["equipment"] = 0
     player["credits"] += credit_delta
+
+
+# --- Space-station stubs ----------------------------------------------
+# apply_station_upkeep is a no-op here (just returns the live row): the
+# real fuel-burn / upgrade-completion math is exercised against real
+# SQLite in db_test. These stubs back the command-flow tests.
+
+def _stub_set_ship_station_core(player_id, has_core):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["station_core"] = 1 if has_core else 0
+
+
+def _stub_set_ship_cargo(player_id, fuel_ore, organics, equipment):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["fuel_ore"] = fuel_ore
+        pl["organics"] = organics
+        pl["equipment"] = equipment
+
+
+def _stub_adjust_player_credits(player_id, delta):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["credits"] += delta
+
+
+def _stub_get_station_in_sector(sector_id):
+    for st in STATE["stations"].values():
+        if st["sector_id"] == sector_id:
+            return dict(st)
+    return None
+
+
+def _stub_get_station(station_id):
+    st = STATE["stations"].get(station_id)
+    return dict(st) if st else None
+
+
+def _stub_get_stations_by_owner(owner_id):
+    return [dict(st) for st in STATE["stations"].values() if st["owner_id"] == owner_id]
+
+
+def _stub_create_station(owner_id, owner_name, sector_id):
+    sid = STATE["next_station_id"]
+    STATE["next_station_id"] += 1
+    STATE["stations"][sid] = {
+        "id": sid, "sector_id": sector_id, "owner_id": owner_id,
+        "owner_name": owner_name, "level": 1, "shields": 0, "fighters": 0,
+        "shields_enabled": 0, "fuel": 0, "organics": 0, "equipment": 0,
+        "posture": "defensive", "engage_pct": 100,
+        "last_fuel_burn": "2026-06-27T12:00:00+00:00",
+        "upgrade_to": None, "upgrade_started_at": None,
+    }
+    return dict(STATE["stations"][sid])
+
+
+def _stub_delete_station(station_id):
+    STATE["stations"].pop(station_id, None)
+
+
+def _stub_deposit_to_station(station_id, fuel=0, organics=0, equipment=0):
+    st = STATE["stations"][station_id]
+    st["fuel"] += fuel
+    st["organics"] += organics
+    st["equipment"] += equipment
+
+
+def _stub_set_station_defenses(station_id, shields, fighters):
+    st = STATE["stations"][station_id]
+    st["shields"] = shields
+    st["fighters"] = fighters
+
+
+def _stub_set_station_posture(station_id, posture, engage_pct=None):
+    st = STATE["stations"][station_id]
+    st["posture"] = posture
+    if engage_pct is not None:
+        st["engage_pct"] = engage_pct
+
+
+def _stub_set_station_shields(station_id, enabled, shields, last_fuel_burn=None):
+    st = STATE["stations"][station_id]
+    st["shields_enabled"] = 1 if enabled else 0
+    st["shields"] = shields
+    if last_fuel_burn is not None:
+        st["last_fuel_burn"] = last_fuel_burn
+
+
+def _stub_apply_station_upkeep(station_id, now=None):
+    return _stub_get_station(station_id)
+
+
+def _stub_start_station_upgrade(station_id, target_level, now=None):
+    spec = STATION_UPGRADES[target_level]
+    st = STATE["stations"][station_id]
+    st["fuel"] -= spec["fuel"]
+    st["organics"] -= spec["organics"]
+    st["equipment"] -= spec["equipment"]
+    st["upgrade_to"] = target_level
+    st["upgrade_started_at"] = "2026-06-27T12:00:00+00:00"
+    return dict(st)
 
 
 def _install_stub_modules():
@@ -490,6 +623,28 @@ def _install_stub_modules():
     db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
     db_stub.HOME_SECTOR = HOME_SECTOR
     db_stub.SAFE_ZONE_MAX_SECTOR = SAFE_ZONE_MAX_SECTOR
+    db_stub.set_ship_station_core = _stub_set_ship_station_core
+    db_stub.set_ship_cargo = _stub_set_ship_cargo
+    db_stub.adjust_player_credits = _stub_adjust_player_credits
+    db_stub.get_station_in_sector = _stub_get_station_in_sector
+    db_stub.get_station = _stub_get_station
+    db_stub.get_stations_by_owner = _stub_get_stations_by_owner
+    db_stub.create_station = _stub_create_station
+    db_stub.delete_station = _stub_delete_station
+    db_stub.deposit_to_station = _stub_deposit_to_station
+    db_stub.set_station_defenses = _stub_set_station_defenses
+    db_stub.set_station_posture = _stub_set_station_posture
+    db_stub.set_station_shields = _stub_set_station_shields
+    db_stub.apply_station_upkeep = _stub_apply_station_upkeep
+    db_stub.start_station_upgrade = _stub_start_station_upgrade
+    db_stub.station_caps = station_caps
+    db_stub.station_daily_fuel_burn = station_daily_fuel_burn
+    db_stub.STATION_CORE_PRICE = STATION_CORE_PRICE
+    db_stub.STATION_CORE_HOLDS = STATION_CORE_HOLDS
+    db_stub.STATION_MAX_LEVEL = STATION_MAX_LEVEL
+    db_stub.STATION_LEVEL_CAPS = STATION_LEVEL_CAPS
+    db_stub.STATION_UPGRADES = STATION_UPGRADES
+    db_stub.SHIELD_FUEL_BURN_PER_SHIELD = SHIELD_FUEL_BURN_PER_SHIELD
     db_stub.STARDOCK_PRICES = {"holds_total": 500, "fighters": 50, "shields": 25, "mines": 1000, "probes": 100}
     sys.modules["db"] = db_stub
 
@@ -539,6 +694,7 @@ def fresh_player(**overrides):
         "fuel_ore": 0,
         "organics": 0,
         "equipment": 0,
+        "station_core": 0,
     }
     base.update(overrides)
     return base
@@ -2488,6 +2644,240 @@ class TurnCostTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(STATE["player"]["turns_remaining"], 100)            # attacker didn't move
         self.assertEqual(STATE["players_by_id"][2]["turns_remaining"], 100)  # victim's knockback is free
+
+
+class StationCommandTests(unittest.IsolatedAsyncioTestCase):
+    """Deploying, docking/managing, and fighting space stations."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["stations"] = {}
+        STATE["next_station_id"] = 1
+        STATE["players_by_id"] = {}
+        STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["move_log"] = []
+        STATE["defense_log"] = []
+        STATE["ship_log"] = []
+        STATE["warps"] = {19: [20], 20: [19], 21: [20]}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["sector_mines"] = {}
+        STATE["sector_players"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _station(self, owner_id=1, owner_name="Tester", sector=20, **over):
+        sid = STATE["next_station_id"]
+        STATE["next_station_id"] += 1
+        st = {
+            "id": sid, "sector_id": sector, "owner_id": owner_id,
+            "owner_name": owner_name, "level": 1, "shields": 0, "fighters": 0,
+            "shields_enabled": 0, "fuel": 0, "organics": 0, "equipment": 0,
+            "posture": "defensive", "engage_pct": 100,
+            "last_fuel_burn": "2026-06-27T12:00:00+00:00",
+            "upgrade_to": None, "upgrade_started_at": None,
+        }
+        st.update(over)
+        STATE["stations"][sid] = st
+        return st
+
+    async def dock(self):
+        return await main.cmd_station(self.ctx(), "")
+
+    async def say(self, text):
+        return await main.cmd_station_step(self.ctx(), text)
+
+    # --- deploy ---
+    async def test_deploy_requires_a_kit(self):
+        STATE["player"] = fresh_player(sector_id=20, station_core=0)
+        self.assertIn("not carrying", await main.cmd_deploy(self.ctx(), ""))
+
+    async def test_deploy_blocked_in_safe_zone(self):
+        STATE["player"] = fresh_player(sector_id=5, station_core=1)
+        self.assertIn("safe zone", await main.cmd_deploy(self.ctx(), ""))
+
+    async def test_deploy_one_per_sector(self):
+        STATE["player"] = fresh_player(sector_id=20, station_core=1)
+        self._station(owner_id=2, owner_name="Zara", sector=20)
+        self.assertIn("already a space station", await main.cmd_deploy(self.ctx(), ""))
+
+    async def test_deploy_success_consumes_kit(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, station_core=1)
+        prompt = await main.cmd_deploy(self.ctx(), "")
+        self.assertIn("Deployed Space Station - Tester in Sec20", prompt)
+        self.assertEqual(STATE["player"]["station_core"], 0)        # kit consumed
+        st = main.get_station_in_sector(20)
+        self.assertEqual((st["owner_id"], st["level"]), (1, 1))
+
+    # --- info screen ---
+    async def test_info_shows_station_with_fighters_not_shields(self):
+        STATE["player"] = fresh_player(id=1, sector_id=20)
+        self._station(owner_id=2, owner_name="Zara", sector=20, fighters=7, shields=999)
+        prompt = await main.cmd_info(self.ctx(), "")
+        self.assertIn("Space Station - Zara (7 ftr)", prompt)
+        self.assertNotIn("999", prompt)
+
+    # --- docking access ---
+    async def test_dock_nonowner_is_denied(self):
+        STATE["player"] = fresh_player(id=1, sector_id=20)
+        self._station(owner_id=2, owner_name="Zara", sector=20)
+        prompt = await self.dock()
+        self.assertIn("isn't yours", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_STATIONS)
+
+    async def test_dock_owner_opens_menu(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station(owner_id=1, owner_name="Tester", sector=20)
+        prompt = await self.dock()
+        self.assertIn("Station options:", prompt)
+        self.assertIn(PUBKEY, main.PENDING_STATIONS)
+
+    async def test_dock_no_station_here(self):
+        STATE["player"] = fresh_player(id=1, sector_id=20)
+        self.assertIn("no space station", await self.dock())
+
+    # --- management ---
+    async def test_deposit_all_cargo(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       fuel_ore=100, organics=50, equipment=25)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20)
+        await self.dock()
+        prompt = await self.say("1")
+        self.assertIn("Deposited 100 fuel, 50 organics, 25 equipment", prompt)
+        self.assertEqual((st["fuel"], st["organics"], st["equipment"]), (100, 50, 25))
+        self.assertEqual((STATE["player"]["fuel_ore"], STATE["player"]["organics"]), (0, 0))
+
+    async def test_transfer_fighters(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, fighters=200)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20)
+        await self.dock()
+        await self.say("2")
+        prompt = await self.say("150")
+        self.assertIn("Transferred 150 fighters", prompt)
+        self.assertEqual(st["fighters"], 150)
+        self.assertEqual(STATE["player"]["fighters"], 50)
+
+    async def test_enable_shields_needs_fuel_then_powers_up(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20, fuel=50)
+        await self.dock()
+        self.assertIn("Not enough fuel", await self.say("3"))   # 50 < 100/day
+        st["fuel"] = 100
+        prompt = await self.say("3")
+        self.assertIn("Shields online at 1000 (100 fuel/day)", prompt)
+        self.assertEqual((st["shields_enabled"], st["shields"]), (1, 1000))
+
+    async def test_disable_shields(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20,
+                           shields_enabled=1, shields=1000, fuel=500)
+        await self.dock()
+        prompt = await self.say("3")
+        self.assertIn("powered down", prompt)
+        self.assertEqual((st["shields_enabled"], st["shields"]), (0, 0))
+
+    async def test_set_posture_offensive_with_pct(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20)
+        await self.dock()
+        await self.say("4")
+        await self.say("o")
+        prompt = await self.say("50")
+        self.assertIn("offensive, engaging 50%", prompt)
+        self.assertEqual((st["posture"], st["engage_pct"]), ("offensive", 50))
+
+    async def test_upgrade_short_on_resources(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, credits=0)
+        self._station(owner_id=1, owner_name="Tester", sector=20)
+        await self.dock()
+        prompt = await self.say("5")
+        self.assertIn("short:", prompt)
+
+    async def test_upgrade_starts_when_affordable(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, credits=10_000_000)
+        st = self._station(owner_id=1, owner_name="Tester", sector=20,
+                           fuel=2500, organics=2000, equipment=1000)
+        await self.dock()
+        self.assertIn("Confirm? yes/no", await self.say("5"))
+        prompt = await self.say("yes")
+        self.assertIn("Upgrade to Lvl 2 started", prompt)
+        self.assertEqual(STATE["player"]["credits"], 0)
+        self.assertEqual(st["upgrade_to"], 2)
+        self.assertEqual((st["fuel"], st["organics"], st["equipment"]), (0, 0, 0))
+
+    # --- attacking a station ---
+    async def test_attack_station_hit_not_destroyed(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, fighters=100)
+        st = self._station(owner_id=2, owner_name="Zara", sector=20, fighters=50, shields=2000)
+        await main.cmd_attack(self.ctx(), "station")
+        prompt = await main.cmd_attack_step(self.ctx(), "100")
+        self.assertIn("You hit Space Station - Zara", prompt)
+        self.assertEqual(st["fighters"], 0)
+        self.assertEqual(st["shields"], 1380)        # 2000 - 62*10
+        self.assertEqual(STATE["attack_events"], [])  # only a hit, no destroy notice
+
+    async def test_attack_station_destroyed_notifies_owner(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, fighters=100)
+        self._station(owner_id=2, owner_name="Zara", sector=20, fighters=50, shields=0)
+        await main.cmd_attack(self.ctx(), "station")
+        prompt = await main.cmd_attack_step(self.ctx(), "100")
+        self.assertIn("You destroyed Space Station - Zara", prompt)
+        self.assertEqual(main.get_station_in_sector(20), None)   # removed
+        self.assertEqual(STATE["attack_events"][0]["victim_id"], 2)
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "station_destroyed")
+        self.assertEqual(STATE["kills"], [])                     # stations aren't kill-logged
+
+    async def test_cannot_attack_your_own_station(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20, fighters=100)
+        self._station(owner_id=1, owner_name="Tester", sector=20, fighters=50)
+        self.assertIn("No other ships here", await main.cmd_attack(self.ctx(), ""))
+        self.assertIn("no enemy station", await main.cmd_attack(self.ctx(), "station"))
+
+    # --- offensive station fires on entry ---
+    async def test_offensive_station_damages_entrant(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=19,
+                                       fighters=2000, shields=5000, turns_remaining=50)
+        st = self._station(owner_id=2, owner_name="Zara", sector=20,
+                           posture="offensive", engage_pct=100, fighters=100, shields=0)
+        prompt = await main.cmd_move(self.ctx(), "20")
+        self.assertIn("Space Station - Zara opens fire!", prompt)
+        self.assertIn("You're left with 1867 fighters, 5000 shields", prompt)
+        self.assertEqual(st["fighters"], 0)            # committed 100, none survived
+        self.assertEqual(STATE["player"]["sector_id"], 20)  # survived, still there
+
+    async def test_offensive_station_can_destroy_entrant(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=19,
+                                       fighters=10, shields=0, turns_remaining=50)
+        self._station(owner_id=2, owner_name="Zara", sector=20,
+                      posture="offensive", engage_pct=100, fighters=1000, shields=0)
+        prompt = await main.cmd_move(self.ctx(), "20")
+        self.assertIn("Space Station - Zara opens fire as you arrive!", prompt)
+        self.assertEqual(STATE["player"]["ship_type"], "Escape Pod")   # ejected
+        self.assertEqual(STATE["kills"][-1]["killer_name"], "Space Station - Zara")
+        self.assertEqual(STATE["kills"][-1]["kind"], "ship")
+
+    async def test_defensive_station_ignores_entrant(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=19,
+                                       fighters=10, turns_remaining=50)
+        self._station(owner_id=2, owner_name="Zara", sector=20,
+                      posture="defensive", fighters=1000)
+        prompt = await main.cmd_move(self.ctx(), "20")
+        self.assertIn("Moved to Sec20", prompt)
+        self.assertNotIn("opens fire", prompt)
+
+    async def test_own_offensive_station_never_fires_on_owner(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=19,
+                                       fighters=10, turns_remaining=50)
+        self._station(owner_id=1, owner_name="Tester", sector=20,
+                      posture="offensive", fighters=1000)
+        prompt = await main.cmd_move(self.ctx(), "20")
+        self.assertNotIn("opens fire", prompt)
+        self.assertEqual(STATE["player"]["fighters"], 10)  # untouched
 
 
 if __name__ == "__main__":

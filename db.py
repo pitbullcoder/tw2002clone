@@ -101,7 +101,8 @@ def init_db():
             probes INTEGER NOT NULL DEFAULT 0,
             fuel_ore INTEGER NOT NULL DEFAULT 0,
             organics INTEGER NOT NULL DEFAULT 0,
-            equipment INTEGER NOT NULL DEFAULT 0
+            equipment INTEGER NOT NULL DEFAULT 0,
+            station_core INTEGER NOT NULL DEFAULT 0
         )
     """)
     # Migration for databases created before mines existed -- CREATE
@@ -117,6 +118,14 @@ def init_db():
     # as the mines column above).
     try:
         conn.execute("ALTER TABLE ships ADD COLUMN probes INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
+    # Migration for databases created before space stations existed: the
+    # flag for whether the ship is hauling an undeployed Space Station Core
+    # kit (which also occupies STATION_CORE_HOLDS holds while carried).
+    try:
+        conn.execute("ALTER TABLE ships ADD COLUMN station_core INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # already has the column
 
@@ -175,6 +184,36 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_kills_created ON kills(created_at)")
 
+    # Player-built space stations -- one per sector (sector_id UNIQUE).
+    # shields/fighters are current strength (both start at 0); their caps
+    # come from `level` via station_caps(). shields_enabled toggles the
+    # fuel-powered shield; fuel/organics/equipment is the shared material
+    # stockpile (fuel powers shields AND, with the others, feeds upgrades).
+    # posture is 'defensive' or 'offensive'; engage_pct is the % of
+    # fighters the station commits when it auto-attacks a non-owner who
+    # enters while it's offensive. last_fuel_burn anchors the daily shield
+    # upkeep; upgrade_to / upgrade_started_at track an in-progress upgrade.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sector_id INTEGER NOT NULL UNIQUE REFERENCES sectors(id),
+            owner_id INTEGER NOT NULL REFERENCES players(id),
+            owner_name TEXT NOT NULL,
+            level INTEGER NOT NULL DEFAULT 1,
+            shields INTEGER NOT NULL DEFAULT 0,
+            fighters INTEGER NOT NULL DEFAULT 0,
+            shields_enabled INTEGER NOT NULL DEFAULT 0,
+            fuel INTEGER NOT NULL DEFAULT 0,
+            organics INTEGER NOT NULL DEFAULT 0,
+            equipment INTEGER NOT NULL DEFAULT 0,
+            posture TEXT NOT NULL DEFAULT 'defensive',
+            engage_pct INTEGER NOT NULL DEFAULT 100,
+            last_fuel_burn TEXT NOT NULL,
+            upgrade_to INTEGER,
+            upgrade_started_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -210,6 +249,20 @@ def _last_reset_boundary(now_utc):
     if now_eastern < boundary:
         boundary -= timedelta(days=1)  # today's 3am hasn't arrived yet
     return boundary.astimezone(timezone.utc)
+
+
+def _reset_days_between(earlier_iso, now_utc):
+    """How many daily (3am-Eastern) reset boundaries have been crossed
+    between `earlier_iso` (an ISO-8601 timestamp) and `now_utc`. Counts
+    whole reset-days via Eastern calendar dates, so it's correct across
+    daylight-saving changes (unlike dividing a timedelta by 24h). Used for
+    both station shield upkeep and upgrade completion."""
+    earlier = datetime.fromisoformat(earlier_iso)
+    if earlier.tzinfo is None:
+        earlier = earlier.replace(tzinfo=timezone.utc)
+    d_now = _last_reset_boundary(now_utc).astimezone(_EASTERN).date()
+    d_earlier = _last_reset_boundary(earlier).astimezone(_EASTERN).date()
+    return max(0, (d_now - d_earlier).days)
 
 DEFAULT_SHIP_TYPE = "Falcon"
 
@@ -412,6 +465,54 @@ STARTER_SHIP = {
     "mines": SHIP_CATALOG[DEFAULT_SHIP_TYPE]["base_mines"],
 }
 
+
+# --- Space stations ----------------------------------------------------
+# A player buys a Space Station Core kit at the Stardock, hauls it to a
+# sector outside the safe zone, and deploys it as a permanent structure.
+STATION_CORE_PRICE = 5_000_000   # credits to buy the kit
+STATION_CORE_HOLDS = 150         # cargo holds the kit occupies while hauling
+
+# Per-level capacity caps. A station starts at level 1; levels 2-4 are
+# unlocked by upgrades (see STATION_UPGRADES). Shields and fighters both
+# start at 0 -- fighters are transferred in from a ship, shields are
+# powered up by burning fuel. These caps are the ceiling each can reach at
+# a given level. (Caps are a tunable design choice -- adjust freely.)
+STATION_LEVEL_CAPS = {
+    1: {"max_shields": 1000, "max_fighters": 1000},
+    2: {"max_shields": 2500, "max_fighters": 2500},
+    3: {"max_shields": 5000, "max_fighters": 5000},
+    4: {"max_shields": 10000, "max_fighters": 10000},
+}
+STATION_MAX_LEVEL = 4
+
+# What it takes to upgrade TO each level: credits (paid by the owner),
+# materials drawn from the station's own stockpile, and the number of
+# daily (3am-Eastern) boundaries that must pass before it completes.
+STATION_UPGRADES = {
+    2: {"credits": 10_000_000, "fuel": 2500, "organics": 2000, "equipment": 1000, "days": 5},
+    3: {"credits": 12_500_000, "fuel": 3500, "organics": 2500, "equipment": 1750, "days": 8},
+    4: {"credits": 15_000_000, "fuel": 5000, "organics": 3500, "equipment": 2000, "days": 12},
+}
+
+# Fuel burned per active shield point per day while shields are enabled
+# (0.1 -> 100 fuel/day to run 1000 shields). Drawn from the same fuel
+# stockpile that feeds upgrades. If a day's burn can't be covered, shields
+# drop to 0 and power off until refuelled and re-enabled.
+SHIELD_FUEL_BURN_PER_SHIELD = 0.1
+
+
+def station_caps(level):
+    """(max_shields, max_fighters) for a station at `level`."""
+    caps = STATION_LEVEL_CAPS[level]
+    return caps["max_shields"], caps["max_fighters"]
+
+
+def station_daily_fuel_burn(level):
+    """Whole fuel units burned per day to run a fully-charged shield at
+    `level` (rounded). This is the cost of keeping shields enabled."""
+    max_shields, _ = station_caps(level)
+    return round(SHIELD_FUEL_BURN_PER_SHIELD * max_shields)
+
 # Stardock refit prices, in credits per unit. Keyed by the ships column
 # each upgrade applies to, so callers can go straight from a column name
 # to its price without a separate lookup table. Same price regardless of
@@ -555,7 +656,7 @@ def buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit
     conn.execute(
         """UPDATE ships
            SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?, mines = ?,
-               probes = 0, fuel_ore = 0, organics = 0, equipment = 0
+               probes = 0, fuel_ore = 0, organics = 0, equipment = 0, station_core = 0
            WHERE player_id = ?""",
         (ship_type, holds_total, fighters, shields, mines, player_id)
     )
@@ -684,6 +785,31 @@ def set_ship_defenses(player_id, shields, fighters):
     conn.close()
 
 
+def set_ship_cargo(player_id, fuel_ore, organics, equipment):
+    """Set a ship's commodity cargo to absolute values -- used when
+    offloading materials into a station's stockpile."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET fuel_ore = ?, organics = ?, equipment = ? WHERE player_id = ?",
+        (fuel_ore, organics, equipment, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def adjust_player_credits(player_id, delta):
+    """Change a player's credit balance by `delta` (negative to spend).
+    Used for purchases that aren't a hull swap -- the Station Core kit and
+    station upgrades."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET credits = credits + ? WHERE id = ?",
+        (delta, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_player_with_ship(pubkey_prefix):
     """Fetch a player joined with their ship, as a dict. None if no such player."""
     conn = get_connection()
@@ -692,7 +818,8 @@ def get_player_with_ship(pubkey_prefix):
                ships.id AS ship_id, ships.ship_type, ships.holds_total,
                ships.fighters, ships.shields, ships.mines,
                ships.probes,
-               ships.fuel_ore, ships.organics, ships.equipment
+               ships.fuel_ore, ships.organics, ships.equipment,
+               ships.station_core
         FROM players
         JOIN ships ON ships.player_id = players.id
         WHERE players.pubkey_prefix = ?
@@ -850,6 +977,182 @@ def mark_kill_log_seen(player_id):
     )
     conn.commit()
     conn.close()
+
+
+# --- Space stations ----------------------------------------------------
+
+def set_ship_station_core(player_id, has_core):
+    """Set (or clear) the undeployed Station Core kit flag on a ship."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET station_core = ? WHERE player_id = ?",
+        (1 if has_core else 0, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_station_in_sector(sector_id):
+    """The station in `sector_id` as a dict, or None. Pure read -- it does
+    NOT apply daily upkeep (call apply_station_upkeep for that)."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM stations WHERE sector_id = ?", (sector_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_station(station_id):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM stations WHERE id = ?", (station_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_stations_by_owner(owner_id):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM stations WHERE owner_id = ? ORDER BY sector_id", (owner_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_station(owner_id, owner_name, sector_id):
+    """Deploy a fresh level-1 station for `owner_id` in `sector_id`.
+    Returns the new station dict. Caller must have verified the sector is
+    outside the safe zone and has no station already."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO stations (sector_id, owner_id, owner_name, last_fuel_burn)
+           VALUES (?, ?, ?, ?)""",
+        (sector_id, owner_id, owner_name, now)
+    )
+    station_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return get_station(station_id)
+
+
+def delete_station(station_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM stations WHERE id = ?", (station_id,))
+    conn.commit()
+    conn.close()
+
+
+def _update_station(station_id, **fields):
+    """Set arbitrary station columns in one statement."""
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    conn = get_connection()
+    conn.execute(
+        f"UPDATE stations SET {cols} WHERE id = ?",
+        (*fields.values(), station_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def deposit_to_station(station_id, fuel=0, organics=0, equipment=0):
+    """Add materials to a station's stockpile (caller moves them off the
+    ship separately)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE stations SET fuel = fuel + ?, organics = organics + ?, "
+        "equipment = equipment + ? WHERE id = ?",
+        (fuel, organics, equipment, station_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_station_defenses(station_id, shields, fighters):
+    _update_station(station_id, shields=shields, fighters=fighters)
+
+
+def set_station_posture(station_id, posture, engage_pct=None):
+    if engage_pct is None:
+        _update_station(station_id, posture=posture)
+    else:
+        _update_station(station_id, posture=posture, engage_pct=engage_pct)
+
+
+def set_station_shields(station_id, enabled, shields, last_fuel_burn=None):
+    """Toggle a station's shields. Enabling charges them to `shields` and
+    stamps last_fuel_burn (so the daily upkeep clock restarts); disabling
+    sets shields to 0."""
+    fields = {"shields_enabled": 1 if enabled else 0, "shields": shields}
+    if last_fuel_burn is not None:
+        fields["last_fuel_burn"] = last_fuel_burn
+    _update_station(station_id, **fields)
+
+
+def apply_station_upkeep(station_id, now=None):
+    """
+    Bring a station up to date lazily: complete any in-progress upgrade
+    whose days have elapsed, then charge daily shield fuel for the whole
+    reset-days since last_fuel_burn. If shields are enabled and the fuel
+    stockpile can't cover a day, shields drop to 0 and power off. Persists
+    and returns the refreshed station dict (None if it no longer exists).
+    """
+    station = get_station(station_id)
+    if station is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+
+    changes = {}
+
+    # Complete a finished upgrade first (so the new level's caps/costs apply).
+    if station["upgrade_to"] is not None and station["upgrade_started_at"]:
+        needed = STATION_UPGRADES[station["upgrade_to"]]["days"]
+        if _reset_days_between(station["upgrade_started_at"], now) >= needed:
+            station["level"] = station["upgrade_to"]
+            changes.update(level=station["upgrade_to"],
+                           upgrade_to=None, upgrade_started_at=None)
+
+    # Daily shield fuel burn.
+    if station["shields_enabled"]:
+        days = _reset_days_between(station["last_fuel_burn"], now)
+        if days > 0:
+            daily = station_daily_fuel_burn(station["level"])
+            max_shields, _ = station_caps(station["level"])
+            affordable = station["fuel"] // daily if daily > 0 else days
+            if days <= affordable:
+                changes["fuel"] = station["fuel"] - days * daily
+                changes["shields"] = max_shields            # recharged for the day
+            else:
+                changes["fuel"] = station["fuel"] - affordable * daily
+                changes["shields"] = 0
+                changes["shields_enabled"] = 0
+            changes["last_fuel_burn"] = now.isoformat()
+
+    if changes:
+        _update_station(station_id, **changes)
+        return get_station(station_id)
+    return station
+
+
+def start_station_upgrade(station_id, target_level, now=None):
+    """Begin an upgrade to `target_level`: consume the material cost from
+    the stockpile and stamp the start time. Credits are deducted from the
+    owner by the caller. Caller validates affordability/materials first."""
+    now = now or datetime.now(timezone.utc)
+    spec = STATION_UPGRADES[target_level]
+    conn = get_connection()
+    conn.execute(
+        "UPDATE stations SET fuel = fuel - ?, organics = organics - ?, "
+        "equipment = equipment - ?, upgrade_to = ?, upgrade_started_at = ? "
+        "WHERE id = ?",
+        (spec["fuel"], spec["organics"], spec["equipment"],
+         target_level, now.isoformat(), station_id)
+    )
+    conn.commit()
+    conn.close()
+    return get_station(station_id)
 
 
 def create_player(pubkey_prefix, name):

@@ -14,9 +14,13 @@ from db import (
     upgrade_ship_stat,
     buy_ship,
     get_player_with_ship,
+    set_ship_station_core,
+    adjust_player_credits,
     SHIP_CATALOG,
     DEFAULT_SHIP_TYPE,
     STARDOCK_PRICES,
+    STATION_CORE_PRICE,
+    STATION_CORE_HOLDS,
     sell_value,
 )
 
@@ -80,6 +84,12 @@ def _shipyard_option(p):
     return len(_available_upgrades(p)) + 1
 
 
+def _station_core_option(p):
+    """Menu number for buying a Space Station Core kit -- one past the
+    shipyard option."""
+    return _shipyard_option(p) + 1
+
+
 def _purchasable_ships():
     """SHIP_CATALOG hull names that can actually be bought, in catalog
     order. Excludes anything flagged "purchasable": False -- namely the
@@ -92,14 +102,19 @@ def _purchasable_ships():
 def build_stardock_menu(p):
     """The top-level Stardock menu: current/max and price for each
     upgradeable stat that applies to the player's current ship, plus an
-    entry into the shipyard. Shown when a player first docks and again
-    after every refit purchase (or skip) so they can keep buying in one
-    visit."""
+    entry into the shipyard and the Space Station Core kit. Shown when a
+    player first docks and again after every refit purchase (or skip) so
+    they can keep buying in one visit."""
     lines = ["Stardock refits:"]
     for i, (label, col, price, cap_key) in enumerate(_available_upgrades(p), start=1):
         limit = _ship_stat_limit(p, cap_key)
         lines.append(f"  {i}) {label} {p[col]}/{limit} @ {price}cr each")
     lines.append(f"  {_shipyard_option(p)}) Shipyard -- buy or sell your ship")
+    kit_tag = " (carrying one)" if p.get("station_core") else ""
+    lines.append(
+        f"  {_station_core_option(p)}) Space Station Core kit -- "
+        f"{STATION_CORE_PRICE}cr, {STATION_CORE_HOLDS} holds{kit_tag}"
+    )
     lines.append(f"{p['credits']}cr available. Reply with a number, or 'cancel'.")
     return "\n".join(lines)
 
@@ -172,7 +187,8 @@ def _build_buy_prompt(state, p, port, item):
     key = item["key"]
     label = item["label"]
     price = port[f"{key}_price"]
-    holds_used = p["fuel_ore"] + p["organics"] + p["equipment"]
+    holds_used = p["fuel_ore"] + p["organics"] + p["equipment"] + (
+        STATION_CORE_HOLDS if p.get("station_core") else 0)
     free_holds = p["holds_total"] - holds_used
     stock = port[f"{key}_qty"]
     max_affordable = p["credits"] // price if price > 0 else free_holds
@@ -367,7 +383,8 @@ async def cmd_trade_step(ctx, message):
         # the port or the player's cargo/credits may have changed since
         # the quote was given a step ago.
         if player_is_buying:
-            holds_used = p["fuel_ore"] + p["organics"] + p["equipment"]
+            holds_used = p["fuel_ore"] + p["organics"] + p["equipment"] + (
+                STATION_CORE_HOLDS if p.get("station_core") else 0)
             free_holds = p["holds_total"] - holds_used
             stock = port[f"{key}_qty"]
             ok = qty <= free_holds and qty <= stock and total_price <= p["credits"]
@@ -395,6 +412,32 @@ async def cmd_trade_step(ctx, message):
     # Shouldn't be reachable, but don't leave a broken trade stuck in state.
     PENDING_TRADES.pop(pubkey, None)
     return "Something went wrong with this trade. Cancelled." + _resume_navigation_suffix(pubkey, p["sector_id"])
+
+
+def _buy_station_core(pubkey, p):
+    """Buy a Space Station Core kit: needs STATION_CORE_HOLDS free holds,
+    STATION_CORE_PRICE credits, and that the ship isn't already carrying
+    one. Returns a result line followed by a freshly-rebuilt Stardock menu
+    (the visit stays open). No-ops with an explanation if it can't go
+    through."""
+    if p.get("station_core"):
+        msg = "You're already hauling a Station Core kit -- deploy it first."
+    else:
+        holds_used = p["fuel_ore"] + p["organics"] + p["equipment"]
+        free_holds = p["holds_total"] - holds_used
+        if free_holds < STATION_CORE_HOLDS:
+            msg = (f"A Station Core kit needs {STATION_CORE_HOLDS} free holds; "
+                   f"you have {free_holds}.")
+        elif p["credits"] < STATION_CORE_PRICE:
+            msg = (f"Can't afford a Station Core kit ({STATION_CORE_PRICE}cr); "
+                   f"you have {p['credits']}cr.")
+        else:
+            adjust_player_credits(p["id"], -STATION_CORE_PRICE)
+            set_ship_station_core(p["id"], True)
+            msg = (f"Bought a Space Station Core kit (-{STATION_CORE_PRICE}cr). It fills "
+                   f"{STATION_CORE_HOLDS} holds -- haul it to a sector outside the safe "
+                   "zone and 'deploy'.")
+    return msg + "\n\n" + build_stardock_menu(get_player_with_ship(pubkey))
 
 
 async def cmd_stardock_step(ctx, message):
@@ -461,6 +504,9 @@ async def cmd_stardock_step(ctx, message):
         if choice == len(available) + 1:
             state["stage"] = "shipyard_menu"
             return build_shipyard_menu(p)
+
+        if choice == len(available) + 2:   # Space Station Core kit
+            return _buy_station_core(pubkey, p)
 
         if choice < 1 or choice > len(available):
             return "Not a valid option.\n\n" + build_stardock_menu(p)

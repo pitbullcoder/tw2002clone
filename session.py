@@ -8,7 +8,7 @@ slow reply, so we time it out either way).
 import asyncio
 import time
 
-from core import PENDING_TRADES, PENDING_WARPS, PENDING_UPGRADES, PENDING_ATTACKS
+from core import PENDING_TRADES, PENDING_WARPS, PENDING_UPGRADES, PENDING_ATTACKS, PENDING_STATIONS
 from messaging import send_reply
 
 
@@ -65,6 +65,7 @@ def _release_session(pubkey):
     PENDING_WARPS.pop(pubkey, None)
     PENDING_UPGRADES.pop(pubkey, None)
     PENDING_ATTACKS.pop(pubkey, None)
+    PENDING_STATIONS.pop(pubkey, None)
     if ACTIVE_SESSION and ACTIVE_SESSION["pubkey"] == pubkey:
         ACTIVE_SESSION = None
 

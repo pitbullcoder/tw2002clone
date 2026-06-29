@@ -1,4 +1,4 @@
-# TradeWars 2002 Clone for MeshCore
+# tw2002clone
 
 A multiplayer space trading-and-combat game inspired by the classic
 **TradeWars 2002** BBS door game, played entirely over a **MeshCore /
@@ -106,6 +106,8 @@ At the **Stardock** (Sector 1) you can:
   up to that hull's maximums.
 * Visit the **shipyard** to buy a different hull or sell your current one.
 * Buy **probes** (recon drones) for scouting.
+* Buy a **Space Station Core kit** (see *Space stations* below) to build your
+  own station out in the galaxy.
 
 ### Navigation
 
@@ -142,6 +144,56 @@ At the **Stardock** (Sector 1) you can:
   through shields, then fighters, then the hull.
 * Your own mines never detonate on you.
 
+### Space stations
+
+Stations are formidable, player-built structures you anchor in a sector to
+hold territory, stockpile materials, and fight on your behalf.
+
+* **Building one.** Buy a **Space Station Core kit** at the Stardock for
+  **5,000,000 cr**. The kit fills **150 cargo holds**, so you need a large,
+  near-empty hull to haul it (a maxed-out **SS Endeavour** is the practical
+  carrier). Fly it to any sector **outside the safe zone (Sectors 1–10)** and
+  `deploy`. Only **one station per sector** is allowed, and swapping hulls at
+  a shipyard while carrying an undeployed kit loses it (it's cargo).
+* **It's yours alone.** Only the owner can `dock` at a station to manage it.
+  It appears on the sector info screen as **`Space Station - <owner>`** with
+  its fighter count (shields stay hidden, just like ships).
+* **Arming it.** A fresh station is **Level 1** with a ceiling of **1000
+  shields and 1000 fighters**, both starting at **0**. Dock to:
+  * **Deposit** fuel, organics, and equipment from your cargo into the
+    station's shared stockpile.
+  * **Transfer fighters** from your ship into the station.
+  * **Power up shields**, which charge to the level cap and **burn 0.1 fuel
+    per shield per day** (100 fuel/day at Level 1) from the stockpile. If a
+    day's burn can't be covered, shields drop to 0 and switch off until you
+    refuel and re-enable. Shields recharge to full each day while powered.
+* **Upgrading (Levels 2–4).** Each upgrade costs **credits + materials from
+  the stockpile + real time**, and only one runs at a time:
+
+  | To level | Credits | Fuel | Organics | Equipment | Days | New caps |
+  |----------|---------|------|----------|-----------|------|----------|
+  | 2 | 10,000,000 | 2500 | 2000 | 1000 | 5  | 2500 / 2500 |
+  | 3 | 12,500,000 | 3500 | 2500 | 1750 | 8  | 5000 / 5000 |
+  | 4 | 15,000,000 | 5000 | 3500 | 2000 | 12 | 10000 / 10000 |
+
+  "Days" are counted by the same 3 AM Eastern daily boundary as turn resets.
+* **Posture.** Set a station **defensive** (default) or **offensive**, and
+  for offensive choose what **percent of its fighters engage**. A defensive
+  station does nothing until attacked. An **offensive** station opens fire on
+  any **non-owner** who enters its sector, committing that percentage of its
+  fighters with the normal combat math — it can damage or destroy them, and a
+  pilot it kills is logged publicly as a kill by `Space Station - <owner>`. A
+  station never fires on its own owner.
+* **Attacking a station.** Anyone can attack one with **`a station`** (kept
+  separate from `a <name>` so a sector can hold both a port and a station).
+  Same fighter-vs-shield math as a ship. When a station's **shields *and*
+  fighters both reach 0 it's destroyed and removed** — the owner gets a
+  private notice the next time they sign in. (Destroying a station isn't
+  entered in the public kill log; it isn't a ship or pod.)
+* **Upkeep is lazy.** There's no background clock: a station's daily fuel
+  burn and upgrade progress are brought up to date whenever the owner signs
+  in or anyone interacts with the station.
+
 ### Death, escape pods & resets
 
 * A destroyed **ship** ejects its pilot into an **Escape Pod**, which drifts
@@ -177,8 +229,10 @@ Send these as direct messages to the game node.
 | `info`  | `i` | Show your current sector: port, warps, and other ships present. |
 | `status`| `st` | Show your credits, sector, ship, and turns remaining. |
 | *(number)* | | Move to that sector (plots a route if it isn't adjacent). |
-| `p`     | `port` | Dock to trade, or to refit / visit the shipyard at a Stardock. |
-| `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). |
+| `p`     | `port` | Dock to trade, or to refit / visit the shipyard / buy a Station Core kit at a Stardock. |
+| `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). Use `a station` to attack a space station. |
+| `deploy` | | Deploy a carried Space Station Core kit in your current sector (outside Sectors 1–10). |
+| `station` | `dock` | Dock at your own space station here to deposit materials, transfer fighters, power shields, set posture, and upgrade. |
 | `lay <n>` | `mine <n>` | Lay `n` mines in your current sector (needs a ship with a mine bay). |
 | `probe <n>` | | Send a recon probe to scout a route to sector `n`. |
 | `combat`| | Show the combat & recon sub-menu. |
@@ -289,8 +343,8 @@ against a throwaway SQLite file.
 
 ```bash
 source venv/bin/activate
-python main_test.py      # game logic (commands, combat, navigation, kill log, ...)
-python db_test.py        # database-level behavior (turns, kill log, presence)
+python main_test.py      # game logic (commands, combat, navigation, kill log, stations, ...)
+python db_test.py        # database-level behavior (turns, kill log, presence, station upkeep)
 python galaxy_test.py    # galaxy generation (port pairs, safe-zone connectivity)
 ```
 
@@ -313,7 +367,8 @@ The game is split into focused modules:
 | `core.py` | Shared game state, the command registry, and the message context. |
 | `db.py` | SQLite schema, all persistence, and the game-balance constants. |
 | `galaxy.py` | One-time generation of sectors, warps, and ports. |
-| `trading.py` | Port trading and the Stardock refit / shipyard flows. |
+| `trading.py` | Port trading and the Stardock refit / shipyard / Station Core flows. |
+| `station.py` | Deploying and managing player-built space stations. |
 | `combat.py` | Pure combat & mine-damage math (no database access). |
 | `pathfinding.py` | Warp-graph routing and escape-pod placement. |
 | `display.py` | Rendering sector info and menus into text screens. |

@@ -207,5 +207,91 @@ class KillLogDbTests(unittest.TestCase):
         self.assertGreaterEqual(after, before)
 
 
+class StationDbTests(unittest.TestCase):
+    """Station persistence + the lazy daily upkeep math (fuel burn,
+    shield shutdown, upgrade completion) against a real db."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "stations.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.executemany("INSERT INTO sectors (id) VALUES (?)", [(1,), (20,)])
+        conn.commit()
+        conn.close()
+        self.player = db.create_player("pk", "Alice")
+        self.station = db.create_station(self.player["id"], "Alice", 20)
+
+    def test_create_defaults(self):
+        st = self.station
+        self.assertEqual(
+            (st["level"], st["shields"], st["fighters"], st["shields_enabled"]),
+            (1, 0, 0, 0),
+        )
+        self.assertEqual((st["posture"], st["engage_pct"]), ("defensive", 100))
+        self.assertEqual((st["fuel"], st["organics"], st["equipment"]), (0, 0, 0))
+
+    def test_caps_and_daily_burn(self):
+        self.assertEqual(db.station_caps(1), (1000, 1000))
+        self.assertEqual(db.station_caps(4), (10000, 10000))
+        self.assertEqual(db.station_daily_fuel_burn(1), 100)   # 0.1 * 1000
+        self.assertEqual(db.station_daily_fuel_burn(4), 1000)  # 0.1 * 10000
+
+    def test_deposit_posture_and_defenses(self):
+        db.deposit_to_station(self.station["id"], fuel=100, organics=50, equipment=25)
+        db.set_station_defenses(self.station["id"], shields=300, fighters=400)
+        db.set_station_posture(self.station["id"], "offensive", engage_pct=60)
+        st = db.get_station(self.station["id"])
+        self.assertEqual((st["fuel"], st["organics"], st["equipment"]), (100, 50, 25))
+        self.assertEqual((st["shields"], st["fighters"]), (300, 400))
+        self.assertEqual((st["posture"], st["engage_pct"]), ("offensive", 60))
+
+    def test_shield_fuel_burns_per_day_and_recharges(self):
+        db.deposit_to_station(self.station["id"], fuel=350)
+        db.set_station_shields(self.station["id"], enabled=True, shields=300,  # damaged
+                               last_fuel_burn="2026-06-10T12:00:00+00:00")
+        # 3 reset-days later: 3 * 100 = 300 fuel burned, shields recharged.
+        now = datetime(2026, 6, 13, 12, 0, tzinfo=timezone.utc)
+        st = db.apply_station_upkeep(self.station["id"], now=now)
+        self.assertEqual(st["fuel"], 50)
+        self.assertEqual(st["shields"], 1000)        # recharged to the level cap
+        self.assertEqual(st["shields_enabled"], 1)
+
+    def test_shields_power_down_when_fuel_cannot_cover_a_day(self):
+        db.deposit_to_station(self.station["id"], fuel=250)  # only 2 days affordable
+        db.set_station_shields(self.station["id"], enabled=True, shields=1000,
+                               last_fuel_burn="2026-06-10T12:00:00+00:00")
+        now = datetime(2026, 6, 13, 12, 0, tzinfo=timezone.utc)  # 3 days
+        st = db.apply_station_upkeep(self.station["id"], now=now)
+        self.assertEqual(st["fuel"], 50)             # 2 days burned, then ran out
+        self.assertEqual(st["shields"], 0)
+        self.assertEqual(st["shields_enabled"], 0)
+
+    def test_upgrade_completes_only_after_required_days(self):
+        db._update_station(self.station["id"], upgrade_to=2,
+                           upgrade_started_at="2026-06-10T12:00:00+00:00")
+        four = db.apply_station_upkeep(
+            self.station["id"], now=datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual((four["level"], four["upgrade_to"]), (1, 2))   # 4 days: not yet
+        five = db.apply_station_upkeep(
+            self.station["id"], now=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual((five["level"], five["upgrade_to"]), (2, None))  # 5 days: done
+        self.assertEqual(db.station_caps(five["level"]), (2500, 2500))
+
+    def test_start_upgrade_draws_materials_from_stockpile(self):
+        db.deposit_to_station(self.station["id"], fuel=3000, organics=3000, equipment=3000)
+        st = db.start_station_upgrade(self.station["id"], 2)
+        spec = db.STATION_UPGRADES[2]
+        self.assertEqual(st["fuel"], 3000 - spec["fuel"])
+        self.assertEqual(st["organics"], 3000 - spec["organics"])
+        self.assertEqual(st["equipment"], 3000 - spec["equipment"])
+        self.assertEqual(st["upgrade_to"], 2)
+
+    def test_get_station_in_sector_and_delete(self):
+        self.assertEqual(db.get_station_in_sector(20)["id"], self.station["id"])
+        self.assertIsNone(db.get_station_in_sector(1))
+        db.delete_station(self.station["id"])
+        self.assertIsNone(db.get_station_in_sector(20))
+
+
 if __name__ == "__main__":
     unittest.main()

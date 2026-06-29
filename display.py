@@ -3,7 +3,7 @@ Read-only rendering of game state into the short text screens players
 see: sector info, the per-sector port/warps lines, and the command menu.
 """
 
-from db import get_port, get_adjacent_sectors, get_players_in_sector
+from db import get_port, get_adjacent_sectors, get_players_in_sector, get_station_in_sector
 
 from core import COMMANDS
 
@@ -79,4 +79,11 @@ def build_sector_info(sector_id, viewer_id=None):
     if others:
         listed = ", ".join(f"{o['name']} ({o['fighters']} ftr)" for o in others)
         lines.append("Ships here: " + listed)
+    station = get_station_in_sector(sector_id)
+    if station is not None:
+        # Mirror the ship display: show the station's fighter strength but
+        # not its shields (which stay hidden until shots are traded).
+        lines.append(
+            f"Space Station - {station['owner_name']} ({station['fighters']} ftr)"
+        )
     return "\n".join(lines)

@@ -56,6 +56,11 @@ from db import (
     DEFAULT_SHIP_TYPE,
     HOME_SECTOR,
     SAFE_ZONE_MAX_SECTOR,
+    get_station_in_sector,
+    get_stations_by_owner,
+    apply_station_upkeep,
+    set_station_defenses,
+    delete_station,
 )
 
 import session
@@ -75,6 +80,7 @@ from core import (
     PENDING_TRADES,
     PENDING_UPGRADES,
     PENDING_ATTACKS,
+    PENDING_STATIONS,
     _warp_confirm_options,
     _resume_navigation_suffix,
 )
@@ -85,6 +91,10 @@ from pathfinding import find_shortest_path, choose_escape_sector
 from pathfinding import sectors_within_hop_range  # noqa: F401
 from combat import roll_mine_damage, apply_mine_damage, resolve_attack, _plural
 from trading import cmd_trade, cmd_trade_step, cmd_stardock_step
+from station import (
+    cmd_deploy, cmd_station, cmd_station_step,
+    engaged_fighters,
+)
 
 print("MeshCore bot started...")
 
@@ -96,6 +106,7 @@ PENDING_WARPS.clear()
 PENDING_TRADES.clear()
 PENDING_UPGRADES.clear()
 PENDING_ATTACKS.clear()
+PENDING_STATIONS.clear()
 session.ACTIVE_SESSION = None
 
 # Public surface this module deliberately exposes -- notably the handlers
@@ -108,10 +119,12 @@ __all__ = [
     "cmd_combat", "cmd_lay_mines", "cmd_probe", "cmd_attack", "cmd_attack_step",
     "cmd_move", "cmd_confirm_warp",
     "cmd_trade", "cmd_trade_step", "cmd_stardock_step",
+    "cmd_deploy", "cmd_station", "cmd_station_step",
     "enter_sector", "run_probe", "resolve_attack",
     "apply_mine_damage", "choose_escape_sector",
     "sectors_within_hop_range",
     "PENDING_WARPS", "PENDING_TRADES", "PENDING_UPGRADES", "PENDING_ATTACKS",
+    "PENDING_STATIONS",
     "on_message", "on_channel_message", "main",
 ]
 
@@ -324,29 +337,67 @@ async def cmd_attack(ctx, args):
         )
 
     foes = get_ships_in_sector(p["sector_id"], p["id"])
-    if not foes:
-        return "No other ships here to attack."
+    station = get_station_in_sector(p["sector_id"])
+    enemy_station = station if (station is not None and station["owner_id"] != p["id"]) else None
 
     arg = args.strip()
-    if arg:
-        target = next((f for f in foes if f["name"].lower() == arg.lower()), None)
-        if target is None:
-            here = ", ".join(f["name"] for f in foes)
-            return f"No ship named '{arg}' here. Ships here: {here}."
-    elif len(foes) == 1:
-        target = foes[0]
+    if arg.lower() == "station":
+        if enemy_station is None:
+            return "There's no enemy station here to attack."
+        target = _station_target(enemy_station)
+    elif not foes and enemy_station is None:
+        return "No other ships here to attack."
+    elif arg:
+        ship = next((f for f in foes if f["name"].lower() == arg.lower()), None)
+        if ship is None:
+            here = ", ".join(f["name"] for f in foes) or "none"
+            hint = " (or 'a station')" if enemy_station else ""
+            return f"No ship named '{arg}' here. Ships here: {here}{hint}."
+        target = ship
     else:
-        here = ", ".join(f["name"] for f in foes)
-        return f"Attack who? Ships here: {here}. Try 'a <name>'."
+        options = len(foes) + (1 if enemy_station else 0)
+        if options == 1:
+            target = foes[0] if foes else _station_target(enemy_station)
+        else:
+            here = ", ".join(f["name"] for f in foes)
+            extra = ""
+            if enemy_station:
+                extra = (("; " if here else "")
+                         + f"Space Station - {enemy_station['owner_name']} (type 'a station')")
+            return f"Attack who? Targets: {here}{extra}. Try 'a <name>'."
 
     if p["fighters"] <= 0:
         return "You have no fighters to attack with."
 
-    PENDING_ATTACKS[ctx.pubkey] = {"target_id": target["id"], "target_name": target["name"]}
+    if target.get("is_station"):
+        PENDING_ATTACKS[ctx.pubkey] = {
+            "is_station": True,
+            "station_id": target["station_id"],
+            "target_name": target["name"],
+        }
+    else:
+        PENDING_ATTACKS[ctx.pubkey] = {
+            "target_id": target["id"],
+            "target_name": target["name"],
+        }
     return (
         f"Attack {target['name']} with how many fighters? "
         f"You have {p['fighters']}. Reply with a number, 'all', or 'cancel'."
     )
+
+
+def _station_target(station):
+    """Build the attack-target dict for a station, shaped enough like a
+    ship target that the fighter-commitment prompt and resolver can treat
+    them the same (with is_station to branch on)."""
+    return {
+        "is_station": True,
+        "station_id": station["id"],
+        "owner_id": station["owner_id"],
+        "name": f"Space Station - {station['owner_name']}",
+        "fighters": station["fighters"],
+        "shields": station["shields"],
+    }
 
 
 async def cmd_attack_step(ctx, message):
@@ -392,12 +443,20 @@ async def cmd_attack_step(ctx, message):
     if engaged > available:
         return f"You only have {available} fighters aboard. Pick up to that, or 'cancel'."
 
-    # Re-fetch the target's current ship row -- they must still be here.
-    foes = get_ships_in_sector(p["sector_id"], p["id"])
-    target = next((f for f in foes if f["id"] == pending["target_id"]), None)
-    if target is None:
-        PENDING_ATTACKS.pop(pubkey, None)
-        return f"{pending['target_name']} is no longer in this sector. Attack called off."
+    # Re-fetch the target's current state -- it must still be in the sector.
+    if pending.get("is_station"):
+        station = get_station_in_sector(p["sector_id"])
+        if station is None or station["id"] != pending["station_id"]:
+            PENDING_ATTACKS.pop(pubkey, None)
+            return f"{pending['target_name']} is no longer here. Attack called off."
+        station = apply_station_upkeep(station["id"])
+        target = _station_target(station)
+    else:
+        foes = get_ships_in_sector(p["sector_id"], p["id"])
+        target = next((f for f in foes if f["id"] == pending["target_id"]), None)
+        if target is None:
+            PENDING_ATTACKS.pop(pubkey, None)
+            return f"{pending['target_name']} is no longer in this sector. Attack called off."
 
     PENDING_ATTACKS.pop(pubkey, None)
     return _resolve_attack(ctx, target, engaged)
@@ -419,6 +478,9 @@ def _resolve_attack(ctx, target, engaged):
     to the attacker -- they have to track the survivor down themselves.
     """
     p = ctx.player
+
+    if target.get("is_station"):
+        return _resolve_attack_on_station(ctx, target, engaged)
 
     atk_after, df_after, ds_after, destroyed = resolve_attack(
         engaged, target["fighters"], target["shields"]
@@ -477,6 +539,39 @@ def _resolve_attack(ctx, target, engaged):
     )
 
 
+def _resolve_attack_on_station(ctx, target, engaged):
+    """
+    Resolve a player's committed attack against a space station. Same
+    fighter-vs-fighter / fighter-vs-shield math as a ship, but on a kill
+    the station is removed from the sector (its owner loses it) and the
+    owner gets a sign-in notice -- a station isn't a ship/pod, so it does
+    NOT go in the public kill log. Returns the attacker-facing report.
+    """
+    p = ctx.player
+
+    atk_after, df_after, ds_after, destroyed = resolve_attack(
+        engaged, target["fighters"], target["shields"]
+    )
+    fighters_after = (p["fighters"] - engaged) + atk_after
+    spent = engaged - atk_after
+    set_ship_defenses(p["id"], p["shields"], fighters_after)  # keep shields, spend fighters
+
+    if destroyed:
+        delete_station(target["station_id"])
+        record_attack_event(target["owner_id"], p["name"], p["sector_id"], "station_destroyed")
+        return (
+            f"You destroyed {target['name']}! It's wreckage now. "
+            f"You have {fighters_after} fighters."
+        )
+
+    set_station_defenses(target["station_id"], ds_after, df_after)
+    return (
+        f"You hit {target['name']} with {_plural(spent, 'fighter')}! "
+        f"It's left with {df_after} fighters, {ds_after} shields. "
+        f"You have {fighters_after} fighters."
+    )
+
+
 def format_attack_notices(events):
     """Turn queued attack_events (oldest first) into the sign-in briefing a
     victim sees -- one line each, phrased by outcome, tagged with when."""
@@ -484,6 +579,7 @@ def format_attack_notices(events):
         "attacked": "{who} attacked you in Sec{sec}",
         "destroyed": "{who} destroyed your ship in Sec{sec}; you ejected in a pod",
         "pod_destroyed": "{who} blew up your escape pod in Sec{sec}; you were reset",
+        "station_destroyed": "{who} destroyed your space station in Sec{sec}",
     }
     lines = ["While you were away:"]
     for e in events:
@@ -555,41 +651,87 @@ def enter_sector(ctx, sector_id, lead, rng=None):
 
     hostile = get_hostile_mine_total(sector_id, p["id"])
     if hostile <= 0:
-        return f"{lead} Sec{sector_id}.\n{build_sector_info(sector_id, p['id'])}", False
+        arrival_line = f"{lead} Sec{sector_id}."
+    else:
+        # The mines go off and are spent, kill or not.
+        clear_hostile_mines(sector_id, p["id"])
+        total_damage = roll_mine_damage(hostile, r)
+        shields_after, fighters_after, shields_lost, fighters_lost, destroyed = apply_mine_damage(
+            p["shields"], p["fighters"], total_damage
+        )
 
-    # The mines go off and are spent, kill or not.
-    clear_hostile_mines(sector_id, p["id"])
-    total_damage = roll_mine_damage(hostile, r)
-    shields_after, fighters_after, shields_lost, fighters_lost, destroyed = apply_mine_damage(
-        p["shields"], p["fighters"], total_damage
-    )
+        if destroyed:
+            # Destroyed by mines. What happens next depends on what blew up:
+            #   * A pilot ALREADY in an Escape Pod has nothing to eject into,
+            #     so they're wiped back to a fresh default ship at the home
+            #     Stardock with credits reset (like a pod-kill).
+            #   * An ordinary hull ejects its pilot into a pod that drifts
+            #     ESCAPE_POD_MIN..MAX hops away.
+            # Either way `destroyed` is True, so a plotted route is dropped.
+            if p["ship_type"] == ESCAPE_POD_SHIP:
+                falcon = SHIP_CATALOG[DEFAULT_SHIP_TYPE]
+                buy_ship(
+                    p["id"], DEFAULT_SHIP_TYPE,
+                    falcon["base_holds"], falcon["base_fighters"], falcon["base_shields"], falcon["base_mines"],
+                    credit_delta=POD_KILL_RESET_CREDITS - p["credits"],
+                )
+                move_player_to_sector(p["id"], HOME_SECTOR)
+                record_kill(p["name"], None, sector_id, "pod")  # None killer = mines
+                message = (
+                    f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
+                    f"Escape Pod is GONE! You lose everything and restart with "
+                    f"{POD_KILL_RESET_CREDITS}cr in a {DEFAULT_SHIP_TYPE} at the Stardock.\n"
+                    f"{build_sector_info(HOME_SECTOR, p['id'])}"
+                )
+                return message, True
 
-    if not destroyed:
+            graph = get_all_warps()
+            escape_sector = choose_escape_sector(graph, sector_id, r)
+            pod = SHIP_CATALOG[ESCAPE_POD_SHIP]
+            buy_ship(
+                p["id"], ESCAPE_POD_SHIP,
+                pod["base_holds"], pod["base_fighters"], pod["base_shields"], pod["base_mines"],
+                credit_delta=0,
+            )
+            if escape_sector is not None:
+                move_player_to_sector(p["id"], escape_sector)
+            landed = escape_sector if escape_sector is not None else sector_id
+            record_kill(p["name"], None, sector_id, "ship")  # None killer = mines
+            message = (
+                f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
+                f"{p['ship_type']} is DESTROYED! You eject in an Escape Pod and drift to "
+                f"Sec{landed} (cargo lost, credits intact).\n{build_sector_info(landed, p['id'])}"
+            )
+            return message, True
+
+        # Survived the mines -- write back the damage and carry on.
         set_ship_defenses(p["id"], shields_after, fighters_after)
-        report = (
+        p = get_player_with_ship(pubkey)
+        arrival_line = (
             f"{lead} Sec{sector_id} -- {_plural(hostile, 'mine')} detonate for "
             f"{total_damage} damage! Lost {shields_lost} shields, {fighters_lost} fighters; "
-            f"now {shields_after} shields, {fighters_after} fighters.\n"
-            f"{build_sector_info(sector_id, p['id'])}"
+            f"now {shields_after} shields, {fighters_after} fighters."
         )
-        return report, False
 
-    # Destroyed. What happens next depends on what just blew up:
-    #
-    #   * A pilot ALREADY in an Escape Pod has nothing left to eject into,
-    #     so running a pod into mines wipes them out completely -- exactly
-    #     as if another player had shot their pod (see cmd_attack's
-    #     pod-kill branch): a fresh default-hull ship, credits reset to
-    #     POD_KILL_RESET_CREDITS, back at the home-sector Stardock.
-    #
-    #   * An ordinary ship instead ejects its pilot into a pod that drifts
-    #     somewhere far off. Re-equip via buy_ship (it swaps the hull,
-    #     zeroes its stats, and clears cargo) at no credit cost, then
-    #     relocate. p["ship_type"] is still the old hull's name here, which
-    #     is what the message wants to report lost.
-    #
-    # Either way `destroyed` comes back True, so a plotted multi-hop route
-    # is dropped -- the player is no longer where that route expected.
+    # An offensive station here opens fire on a non-owner who just arrived
+    # (whether or not there were mines) -- possibly damaging or destroying
+    # them. If it destroys them, that result is returned directly.
+    station_line, destroyed_result = _station_offensive_on_entry(ctx, sector_id)
+    if destroyed_result is not None:
+        return destroyed_result
+    p = get_player_with_ship(pubkey)
+    return f"{arrival_line}{station_line}\n{build_sector_info(sector_id, p['id'])}", False
+
+
+def _eject_player(p, from_sector, killer_name):
+    """
+    Mechanics of `p` losing their ship to `killer_name` (a display-name
+    string, or None for mines) in `from_sector`, returning a short
+    player-facing consequence line (the caller supplies the cause). A pod
+    pilot is wiped back to a fresh default ship at the home Stardock; an
+    ordinary hull ejects into a pod that drifts to an adjacent sector. The
+    public kill is recorded.
+    """
     if p["ship_type"] == ESCAPE_POD_SHIP:
         falcon = SHIP_CATALOG[DEFAULT_SHIP_TYPE]
         buy_ship(
@@ -598,33 +740,74 @@ def enter_sector(ctx, sector_id, lead, rng=None):
             credit_delta=POD_KILL_RESET_CREDITS - p["credits"],
         )
         move_player_to_sector(p["id"], HOME_SECTOR)
-        record_kill(p["name"], None, sector_id, "pod")  # None killer = mines
-        message = (
-            f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
-            f"Escape Pod is GONE! You lose everything and restart with "
-            f"{POD_KILL_RESET_CREDITS}cr in a {DEFAULT_SHIP_TYPE} at the Stardock.\n"
-            f"{build_sector_info(HOME_SECTOR, p['id'])}"
+        record_kill(p["name"], killer_name, from_sector, "pod")
+        return (
+            f"Your escape pod is GONE -- you're reset to a {DEFAULT_SHIP_TYPE} at the "
+            f"Stardock with {POD_KILL_RESET_CREDITS}cr."
         )
-        return message, True
-
-    graph = get_all_warps()
-    escape_sector = choose_escape_sector(graph, sector_id, r)
     pod = SHIP_CATALOG[ESCAPE_POD_SHIP]
     buy_ship(
         p["id"], ESCAPE_POD_SHIP,
         pod["base_holds"], pod["base_fighters"], pod["base_shields"], pod["base_mines"],
         credit_delta=0,
     )
-    if escape_sector is not None:
-        move_player_to_sector(p["id"], escape_sector)
-    landed = escape_sector if escape_sector is not None else sector_id
-    record_kill(p["name"], None, sector_id, "ship")  # None killer = mines
-    message = (
-        f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
-        f"{p['ship_type']} is DESTROYED! You eject in an Escape Pod and drift to "
-        f"Sec{landed} (cargo lost, credits intact).\n{build_sector_info(landed, p['id'])}"
+    adjacent = get_adjacent_sectors(from_sector)
+    dest = random.choice(adjacent) if adjacent else from_sector
+    move_player_to_sector(p["id"], dest)
+    record_kill(p["name"], killer_name, from_sector, "ship")
+    return (
+        f"Your {p['ship_type']} is destroyed -- you eject in an Escape Pod and slip away "
+        "(credits intact)."
     )
-    return message, True
+
+
+def _station_offensive_on_entry(ctx, sector_id):
+    """
+    If an offensive station owned by someone else sits in `sector_id`, it
+    fires on the arriving player with engage_pct% of its fighters (the same
+    fighter-vs-fighter / fighter-vs-shield math players use). The station
+    is brought up to date first (apply_station_upkeep). Returns
+    (station_line, destroyed_result): station_line is text to append to the
+    arrival message ("" if nothing happened); destroyed_result is None
+    unless the player was destroyed, in which case it's the (message, True)
+    tuple enter_sector should return directly.
+    """
+    p = get_player_with_ship(ctx.pubkey)
+    station = get_station_in_sector(sector_id)
+    if station is None:
+        return "", None
+    station = apply_station_upkeep(station["id"])
+    if station is None:
+        return "", None
+    if (station["owner_id"] == p["id"]
+            or station["posture"] != "offensive"
+            or station["fighters"] <= 0):
+        return "", None
+
+    engaged = engaged_fighters(station["fighters"], station["engage_pct"])
+    if engaged <= 0:
+        return "", None
+
+    atk_after, df_after, ds_after, destroyed = resolve_attack(
+        engaged, p["fighters"], p["shields"]
+    )
+    # The station keeps its uncommitted reserve plus the engaged survivors.
+    set_station_defenses(
+        station["id"], station["shields"], (station["fighters"] - engaged) + atk_after
+    )
+    owner = station["owner_name"]
+
+    if destroyed:
+        consequence = _eject_player(p, sector_id, f"Space Station - {owner}")
+        return "", (
+            f"Space Station - {owner} opens fire as you arrive! {consequence}", True
+        )
+
+    set_ship_defenses(p["id"], ds_after, df_after)  # write back the player's losses
+    return (
+        f"\nSpace Station - {owner} opens fire! You're left with "
+        f"{df_after} fighters, {ds_after} shields."
+    ), None
 
 
 async def cmd_move(ctx, args):
@@ -826,6 +1009,10 @@ async def on_message(mc, event):
         events = pop_attack_events(player["id"])
         if events:
             notices.append(format_attack_notices(events))
+        # Bring the player's own stations up to date (daily shield fuel burn
+        # and any completed upgrades) -- lazy upkeep, evaluated on sign-in.
+        for st in get_stations_by_owner(player["id"]):
+            apply_station_upkeep(st["id"])
         cutoff = get_kill_log_cutoff(player["id"])
         kills = get_kills_since(cutoff)
         mark_kill_log_seen(player["id"])
@@ -845,6 +1032,8 @@ async def on_message(mc, event):
         response = await cmd_stardock_step(ctx, message)
     elif pubkey in PENDING_ATTACKS:
         response = await cmd_attack_step(ctx, message)
+    elif pubkey in PENDING_STATIONS:
+        response = await cmd_station_step(ctx, message)
     elif pubkey in PENDING_WARPS:
         response = await cmd_confirm_warp(ctx, message)
     else:
