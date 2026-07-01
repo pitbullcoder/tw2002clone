@@ -45,6 +45,13 @@ PENDING_ATTACKS = {}
 PENDING_STATIONS = {}
 
 
+# pubkey -> dict tracking an in-progress port-to-port shuttle (p2p): the
+# two sectors, the forward/backward commodities, where the next leg moves
+# to, and the running profit. Populated by cmd_p2p (after the player picks
+# a commodity), advanced one leg at a time by cmd_p2p_step.
+PENDING_P2P = {}
+
+
 # Map of command -> (description, async handler(ctx, args) -> str)
 COMMANDS = {}
 

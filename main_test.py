@@ -1750,6 +1750,555 @@ class LayMinesCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(STATE["mine_log"], [])
 
 
+class JettisonCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The 'jettison' command: dumping commodity cargo overboard in its
+    several forms (all / one commodity / a specific amount), the
+    no-accidental-dump bare form, and the rejection paths."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def jettison(self, args):
+        return await main.cmd_jettison(self.ctx(), args)
+
+    def _cargo(self):
+        return (
+            STATE["player"]["fuel_ore"],
+            STATE["player"]["organics"],
+            STATE["player"]["equipment"],
+        )
+
+    async def test_jettison_all_clears_every_hold(self):
+        STATE["player"] = fresh_player(fuel_ore=10, organics=5, equipment=3)
+        msg = await self.jettison("all")
+        self.assertIn("Jettisoned all cargo", msg)
+        # The summary lists what went overboard, in order, non-zero only.
+        self.assertIn("10 fuel ore", msg)
+        self.assertIn("5 organics", msg)
+        self.assertIn("3 equipment", msg)
+        self.assertEqual(self._cargo(), (0, 0, 0))
+
+    async def test_jettison_all_omits_empty_commodities_from_summary(self):
+        STATE["player"] = fresh_player(fuel_ore=4, organics=0, equipment=0)
+        msg = await self.jettison("all")
+        self.assertIn("4 fuel ore", msg)
+        self.assertNotIn("organics", msg)   # zero holds aren't listed
+        self.assertEqual(self._cargo(), (0, 0, 0))
+
+    async def test_jettison_single_commodity_dumps_all_of_it(self):
+        STATE["player"] = fresh_player(fuel_ore=10, organics=5, equipment=3)
+        msg = await self.jettison("organics")
+        self.assertIn("Jettisoned 5 organics into space; 0 still aboard.", msg)
+        self.assertEqual(self._cargo(), (10, 0, 3))   # only organics cleared
+
+    async def test_jettison_partial_amount_leaves_the_rest(self):
+        STATE["player"] = fresh_player(equipment=8)
+        msg = await self.jettison("equipment 3")
+        self.assertIn("Jettisoned 3 equipment into space; 5 still aboard.", msg)
+        self.assertEqual(self._cargo(), (0, 0, 5))
+
+    async def test_commodity_aliases_resolve(self):
+        STATE["player"] = fresh_player(fuel_ore=4)
+        msg = await self.jettison("fuel")        # 'fuel' -> fuel_ore
+        self.assertIn("Jettisoned 4 fuel ore", msg)
+        self.assertEqual(self._cargo(), (0, 0, 0))
+
+    async def test_bare_jettison_shows_manifest_and_dumps_nothing(self):
+        STATE["player"] = fresh_player(fuel_ore=2, organics=1, equipment=0)
+        msg = await self.jettison("")
+        self.assertIn("Aboard:", msg)
+        self.assertIn("fuel ore 2", msg)
+        self.assertIn("equipment 0", msg)        # manifest shows zeros too
+        self.assertEqual(self._cargo(), (2, 1, 0))   # nothing spaced
+
+    async def test_bare_jettison_with_empty_holds(self):
+        STATE["player"] = fresh_player()
+        self.assertIn("holds are empty", await self.jettison(""))
+
+    async def test_jettison_all_with_empty_holds(self):
+        STATE["player"] = fresh_player()
+        self.assertIn("holds are empty", await self.jettison("all"))
+        self.assertEqual(self._cargo(), (0, 0, 0))
+
+    async def test_jettison_commodity_not_aboard(self):
+        STATE["player"] = fresh_player(fuel_ore=5)
+        msg = await self.jettison("organics")
+        self.assertIn("No organics aboard", msg)
+        self.assertEqual(self._cargo(), (5, 0, 0))   # untouched
+
+    async def test_more_than_aboard_is_rejected(self):
+        STATE["player"] = fresh_player(fuel_ore=3)
+        msg = await self.jettison("fuel 5")
+        self.assertIn("only have 3 fuel ore aboard", msg)
+        self.assertEqual(self._cargo(), (3, 0, 0))
+
+    async def test_non_numeric_amount_is_rejected(self):
+        STATE["player"] = fresh_player(fuel_ore=3)
+        msg = await self.jettison("fuel lots")
+        self.assertIn("whole number", msg)
+        self.assertEqual(self._cargo(), (3, 0, 0))
+
+    async def test_zero_amount_is_rejected(self):
+        STATE["player"] = fresh_player(fuel_ore=3)
+        msg = await self.jettison("fuel 0")
+        self.assertIn("from 1 up", msg)
+        self.assertEqual(self._cargo(), (3, 0, 0))
+
+    async def test_unknown_commodity_is_rejected(self):
+        STATE["player"] = fresh_player(fuel_ore=3)
+        msg = await self.jettison("widgets")
+        self.assertIn("fuel/organics/equipment", msg)
+        self.assertEqual(self._cargo(), (3, 0, 0))
+
+    async def test_jettison_does_not_touch_a_station_core_kit(self):
+        # The kit is a separate fixture, not commodity cargo -- 'all' clears
+        # the holds but leaves station_core set.
+        STATE["player"] = fresh_player(fuel_ore=4, station_core=1)
+        await self.jettison("all")
+        self.assertEqual(self._cargo(), (0, 0, 0))
+        self.assertEqual(STATE["player"]["station_core"], 1)
+
+
+def _p2p_port(sector, pid, klass, spec):
+    """Build a port fixture for p2p tests. `spec` maps each commodity to
+    (direction, price). A selling commodity ('S') starts fully stocked; a
+    buying commodity ('B') starts empty with plenty of room."""
+    port = fresh_port(klass, id=pid)
+    port["sector_id"] = sector
+    for key, (direction, price) in spec.items():
+        port[f"{key}_dir"] = direction
+        port[f"{key}_price"] = price
+        port[f"{key}_max"] = 10000
+        port[f"{key}_qty"] = 10000 if direction == "S" else 0
+    return port
+
+
+# Sec100 BSS  <->  Sec101 SBB, priced with a real buy/sell spread so a
+# round trip nets a profit: organics bought at 100 @160 and sold at 101
+# @200 (+40/unit); fuel bought at 101 @90 and sold at 100 @100 (+10/unit).
+_BSS_100 = {"fuel_ore": ("B", 100), "organics": ("S", 160), "equipment": ("S", 260)}
+_SBB_101 = {"fuel_ore": ("S", 90), "organics": ("B", 200), "equipment": ("B", 320)}
+
+# Sec100 BSB  <->  Sec101 SBS: forward is forced to organics (the only
+# commodity home sells); the player chooses fuel or equipment to buy back.
+_BSB_100 = {"fuel_ore": ("B", 100), "organics": ("S", 160), "equipment": ("B", 300)}
+_SBS_101 = {"fuel_ore": ("S", 90), "organics": ("B", 200), "equipment": ("S", 280)}
+
+# Degenerate one-way pairs (all three commodities flow one direction).
+_SSS_100 = {"fuel_ore": ("S", 90), "organics": ("S", 160), "equipment": ("S", 260)}
+_BBB_101 = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+_BBB_100 = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+_SSS_101 = {"fuel_ore": ("S", 90), "organics": ("S", 160), "equipment": ("S", 260)}
+
+
+class P2PCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The 'p2p' port-to-port auto-shuttle: the commodity prompt, the
+    starting-holds rules, the move-and-auto-trade legs, profit, and every
+    way a shuttle ends (stop, out of turns, port can't sustain, attacked)."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        STATE["warps"] = {100: [101], 101: [100]}
+        STATE["ports"] = {}
+        STATE["sector_mines"] = {}
+        STATE["stations"] = {}
+        STATE["trade_log"] = []
+        STATE["move_log"] = []
+        STATE["kills"] = []
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _pair(self, home_spec, adj_spec, home_class="BSS", adj_class="SBB"):
+        STATE["ports"] = {
+            100: _p2p_port(100, 1, home_class, home_spec),
+            101: _p2p_port(101, 2, adj_class, adj_spec),
+        }
+
+    async def p2p(self, args):
+        return await main.cmd_p2p(self.ctx(), args)
+
+    async def step(self, msg):
+        return await main.cmd_p2p_step(self.ctx(), msg)
+
+    # --- setup / prompt ---------------------------------------------------
+
+    async def test_prompt_offers_forward_choice_in_bss_sbb(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=75)
+        prompt = await self.p2p("101")
+        self.assertIn("P2P Sec100<->Sec101", prompt)
+        self.assertIn("organics", prompt)
+        self.assertIn("equipment", prompt)
+        self.assertIn("FULL", prompt)
+        self.assertTrue(main.PENDING_P2P[PUBKEY]["stage"] == "choose")
+
+    async def test_usage_and_geometry_rejections(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=75)
+        self.assertIn("Usage", await self.p2p(""))
+        self.assertIn("isn't adjacent", await self.p2p("500"))
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_no_shuttleable_commodity_rejected(self):
+        # Two identical BSS ports share no commodity that one buys and the
+        # other sells, so there's nothing to shuttle.
+        self._pair(_BSS_100, _BSS_100, adj_class="BSS")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=75)
+        msg = await self.p2p("101")
+        self.assertIn("no commodity to shuttle", msg)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_current_sector_needs_a_commodity_port(self):
+        STATE["ports"] = {101: _p2p_port(101, 2, "SBB", _SBB_101)}  # none at 100
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=75)
+        self.assertIn("needs a commodity port", await self.p2p("101"))
+
+    # --- happy path -------------------------------------------------------
+
+    async def test_full_round_trip_profits_and_restores_cargo(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        leg1 = await self.step("organics")
+        self.assertIn("Entered Sec101, docked.", leg1)
+        self.assertIn("Sold 75 organics for +15000cr", leg1)   # 75 * 200
+        self.assertIn("Bought 75 fuel ore for -6750cr", leg1)   # 75 * 90
+        self.assertIn("Leg +8250cr, total +8250cr", leg1)        # 75*(200-90)
+        self.assertEqual(STATE["player"]["sector_id"], 101)
+        self.assertEqual(STATE["player"]["fuel_ore"], 75)
+        self.assertEqual(STATE["player"]["organics"], 0)
+        self.assertEqual(STATE["player"]["turns_remaining"], 9)
+
+        leg2 = await self.step("y")
+        self.assertIn("Entered Sec100, docked.", leg2)
+        self.assertIn("Sold 75 fuel ore for +7500cr", leg2)     # 75 * 100
+        self.assertIn("Bought 75 organics for -12000cr", leg2)  # 75 * 160
+        self.assertIn("Leg -4500cr, total +3750cr", leg2)       # leg loss, run profit
+        # Back to the start holding organics, one full round-trip of profit.
+        self.assertEqual(STATE["player"]["sector_id"], 100)
+        self.assertEqual(STATE["player"]["organics"], 75)
+        self.assertEqual(STATE["player"]["credits"], 100000 + 3750)  # 75*40 + 75*10
+
+    async def test_auto_max_quantity_and_listed_price(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        await self.step("organics")
+        # First two trades: sell 75 organics @200, buy 75 fuel @90.
+        self.assertEqual(STATE["trade_log"][0], ("organics", 75, 15000, False))
+        self.assertEqual(STATE["trade_log"][1], ("fuel_ore", 75, 6750, True))
+
+    async def test_bsb_sbs_forces_organics_and_chooses_backward(self):
+        self._pair(_BSB_100, _SBS_101, home_class="BSB", adj_class="SBS")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=50,
+                                       organics=50, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("organics", prompt)   # forced forward named
+        self.assertIn("fuel", prompt)        # backward choices
+        self.assertIn("equipment", prompt)
+        leg1 = await self.step("fuel")       # buy fuel back
+        self.assertIn("Sold 50 organics", leg1)
+        self.assertIn("Bought 50 fuel ore", leg1)
+
+    # --- degenerate one-way shuttles -------------------------------------
+
+    async def test_one_way_forward_only_sss_bbb(self):
+        # Home sells all (SSS), adj buys all (BBB): a one-way organics run.
+        self._pair(_SSS_100, _BBB_101, home_class="SSS", adj_class="BBB")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40,
+                                       organics=40, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("One-way", prompt)
+        self.assertIn("FULL", prompt)
+        leg1 = await self.step("organics")
+        self.assertIn("Sold 40 organics for +8000cr", leg1)   # 40*200
+        self.assertNotIn("Bought", leg1)                       # nothing to buy at adj
+        self.assertEqual(STATE["player"]["organics"], 0)
+        leg2 = await self.step("y")                            # back home, rebuy
+        self.assertIn("Bought 40 organics for -6400cr", leg2)  # 40*160
+        self.assertNotIn("Sold", leg2)
+        self.assertEqual(STATE["player"]["organics"], 40)
+
+    async def test_one_way_backward_only_requires_empty_holds(self):
+        self._pair(_BBB_100, _SSS_101, home_class="BBB", adj_class="SSS")
+        # Carrying cargo -> rejected with the empty-holds rule.
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40, organics=10)
+        await self.p2p("101")
+        reject = await self.step("fuel")
+        self.assertIn("EMPTY holds", reject)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+        # Empty holds -> first leg buys at the far port.
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40,
+                                       credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        leg1 = await self.step("fuel")
+        self.assertIn("Bought 40 fuel ore for -3600cr", leg1)  # 40*90
+        self.assertNotIn("Sold", leg1)
+
+    # --- starting-holds rules --------------------------------------------
+
+    async def test_partial_holds_rejected(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=50)
+        await self.p2p("101")
+        reject = await self.step("organics")
+        self.assertIn("FULL of organics", reject)
+        self.assertIn("50/75", reject)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+        self.assertEqual(STATE["trade_log"], [])
+
+    async def test_holds_full_of_wrong_commodity_rejected(self):
+        self._pair(_BSS_100, _SBB_101)
+        # Full of equipment but the player picks organics.
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, equipment=75)
+        await self.p2p("101")
+        reject = await self.step("organics")
+        self.assertIn("FULL of organics", reject)
+
+    async def test_station_core_blocks_start(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, station_core=1)
+        await self.p2p("101")
+        reject = await self.step("organics")
+        self.assertIn("Station Core", reject)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    # --- ending conditions -----------------------------------------------
+
+    async def test_stop_ends_the_shuttle(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        await self.step("organics")
+        for stop in ("n", "no", "s", "stop", "cancel"):
+            STATE["player"]["sector_id"] = 101
+            main.PENDING_P2P[PUBKEY] = {
+                "stage": "continue", "home": 100, "adj": 101,
+                "forward": "organics", "backward": "fuel_ore",
+                "next_dest": 100, "profit": 999,
+            }
+            msg = await self.step(stop)
+            self.assertIn("P2P ended", msg)
+            self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_unrecognized_continue_reply_reprompts(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=101, holds_total=75,
+                                       fuel_ore=75, credits=100000, turns_remaining=10)
+        main.PENDING_P2P[PUBKEY] = {
+            "stage": "continue", "home": 100, "adj": 101,
+            "forward": "organics", "backward": "fuel_ore",
+            "next_dest": 100, "profit": 0,
+        }
+        msg = await self.step("huh?")
+        self.assertIn("y to continue", msg)
+        self.assertIn(PUBKEY, main.PENDING_P2P)   # still running
+
+    async def test_out_of_turns_ends_without_moving(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=0)
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("Out of turns", msg)
+        self.assertEqual(STATE["move_log"], [])    # never moved
+        self.assertEqual(STATE["trade_log"], [])
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_cant_sustain_low_stock_skips_and_ends(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["ports"][101]["fuel_ore_qty"] = 10   # far port can't fill 75 holds
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("can't sustain", msg)
+        self.assertIn("still in Sec100", msg)
+        self.assertEqual(STATE["move_log"], [])    # no move, no turn spent
+        self.assertEqual(STATE["trade_log"], [])
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_cant_sustain_no_room_skips_and_ends(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["ports"][101]["organics_qty"] = 9960  # room only 40 < 75 load
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("can't sustain", msg)
+        self.assertEqual(STATE["trade_log"], [])
+
+    # --- abandon on hostile presence -------------------------------------
+
+    async def test_abandon_on_hostile_mines(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, shields=50, fighters=0,
+                                       credits=100000, turns_remaining=10)
+        STATE["sector_mines"] = {101: {2: 1}}      # someone else's mine
+        main.random = FakeRandom([3])              # 3 damage, survivable
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("detonate", msg)
+        self.assertIn("P2P shuttle abandoned", msg)
+        self.assertEqual(STATE["player"]["sector_id"], 101)  # moved, attacked
+        self.assertEqual(STATE["trade_log"], [])             # but did not trade
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_abandon_on_non_owner_station(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, credits=100000, turns_remaining=10)
+        STATE["stations"] = {9: {
+            "id": 9, "sector_id": 101, "owner_id": 2, "owner_name": "Rival",
+            "level": 1, "shields": 100, "fighters": 0, "shields_enabled": 1,
+            "fuel": 0, "organics": 0, "equipment": 0,
+            "posture": "defensive", "engage_pct": 100,
+            "last_fuel_burn": "2026-06-27T12:00:00+00:00",
+            "upgrade_to": None, "upgrade_started_at": None,
+        }}
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("P2P shuttle abandoned", msg)
+        self.assertEqual(STATE["trade_log"], [])
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_destroyed_mid_leg_ends_shuttle(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["warps"] = {100: [101], 101: [100]}
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75,
+                                       organics=75, shields=0, fighters=0,
+                                       credits=100000, turns_remaining=10)
+        STATE["sector_mines"] = {101: {2: 1}}
+        main.random = FakeRandom([10])             # lethal to a 0/0 ship
+        await self.p2p("101")
+        msg = await self.step("organics")
+        self.assertIn("DESTROYED", msg)
+        self.assertEqual(STATE["trade_log"], [])
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    async def test_cancel_at_choose_stage(self):
+        self._pair(_BSS_100, _SBB_101)
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=75, organics=75)
+        await self.p2p("101")
+        msg = await self.step("cancel")
+        self.assertIn("cancelled", msg)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+
+    # --- partial-overlap pairs (adjacent BBB, and a two-way overlap) -----
+
+    async def test_bss_beside_bbb_one_way_with_forward_choice(self):
+        # BSS sells organics+equipment; BBB buys everything, sells nothing.
+        # A one-way forward run with a choice of organics or equipment.
+        adj_bbb = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+        self._pair(_BSS_100, adj_bbb, adj_class="BBB")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=60,
+                                       organics=60, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("One-way", prompt)
+        self.assertIn("organics", prompt)
+        self.assertIn("equipment", prompt)
+        leg1 = await self.step("organics")
+        self.assertIn("Sold 60 organics for +12000cr", leg1)   # 60*200 at BBB
+        self.assertNotIn("Bought", leg1)                        # BBB sells nothing
+        self.assertEqual(STATE["player"]["organics"], 0)
+        leg2 = await self.step("y")                             # back home, rebuy
+        self.assertIn("Bought 60 organics for -9600cr", leg2)   # 60*160 at BSS
+        self.assertEqual(STATE["player"]["organics"], 60)
+
+    async def test_ssb_beside_bbb_offers_fuel_or_organics(self):
+        ssb = {"fuel_ore": ("S", 90), "organics": ("S", 160), "equipment": ("B", 300)}
+        adj_bbb = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+        self._pair(ssb, adj_bbb, home_class="SSB", adj_class="BBB")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=50,
+                                       fuel_ore=50, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("fuel", prompt)
+        self.assertIn("organics", prompt)
+        self.assertNotIn("equipment", prompt)   # equipment is B/B -> not shuttleable
+        leg1 = await self.step("fuel")
+        self.assertIn("Sold 50 fuel ore for +5000cr", leg1)     # 50*100 at BBB
+
+    async def test_sbb_beside_bbb_is_a_forced_confirm(self):
+        # SBB sells only fuel; beside BBB just one commodity qualifies, so
+        # the prompt is a confirm, not a choice.
+        sbb = {"fuel_ore": ("S", 90), "organics": ("B", 200), "equipment": ("B", 320)}
+        adj_bbb = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+        self._pair(sbb, adj_bbb, home_class="SBB", adj_class="BBB")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40,
+                                       fuel_ore=40, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("Confirm? y/n", prompt)
+        self.assertIn("fuel ore", prompt)
+        # A commodity reply isn't needed -- 'y' starts it.
+        leg1 = await self.step("y")
+        self.assertIn("Sold 40 fuel ore for +4000cr", leg1)     # 40*100 at BBB
+        self.assertNotIn("Bought", leg1)
+
+    async def test_bbs_beside_bbb_forced_confirm_needs_full_holds(self):
+        # BBS sells only equipment; forced confirm, and holds must be full
+        # of equipment to start.
+        bbs = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("S", 260)}
+        adj_bbb = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+        self._pair(bbs, adj_bbb, home_class="BBS", adj_class="BBB")
+        # Wrong cargo -> rejected on confirm.
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40, organics=40)
+        await self.p2p("101")
+        reject = await self.step("y")
+        self.assertIn("FULL of equipment", reject)
+        self.assertNotIn(PUBKEY, main.PENDING_P2P)
+        # Correct cargo -> runs.
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40,
+                                       equipment=40, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        leg1 = await self.step("y")
+        self.assertIn("Sold 40 equipment for +12800cr", leg1)   # 40*320 at BBB
+
+    async def test_forced_confirm_reprompts_on_unrecognized_reply(self):
+        sbb = {"fuel_ore": ("S", 90), "organics": ("B", 200), "equipment": ("B", 320)}
+        adj_bbb = {"fuel_ore": ("B", 100), "organics": ("B", 200), "equipment": ("B", 320)}
+        self._pair(sbb, adj_bbb, home_class="SBB", adj_class="BBB")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=40,
+                                       fuel_ore=40, credits=100000, turns_remaining=10)
+        await self.p2p("101")
+        msg = await self.step("wat")
+        self.assertIn("y to begin", msg)
+        self.assertIn(PUBKEY, main.PENDING_P2P)   # still awaiting confirm
+
+    async def test_two_way_partial_overlap_is_a_forced_confirm(self):
+        # BSS beside SBS: fuel(B/S)=backward, organics(S/B)=forward,
+        # equipment(S/S)=ignored -> a forced two-way organics<->fuel shuttle.
+        sbs = {"fuel_ore": ("S", 90), "organics": ("B", 200), "equipment": ("S", 280)}
+        self._pair(_BSS_100, sbs, adj_class="SBS")
+        STATE["player"] = fresh_player(id=1, sector_id=100, holds_total=50,
+                                       organics=50, credits=100000, turns_remaining=10)
+        prompt = await self.p2p("101")
+        self.assertIn("Confirm? y/n", prompt)
+        leg1 = await self.step("y")
+        self.assertIn("Sold 50 organics for +10000cr", leg1)    # 50*200
+        self.assertIn("Bought 50 fuel ore for -4500cr", leg1)   # 50*90
+        leg2 = await self.step("y")
+        self.assertIn("Sold 50 fuel ore for +5000cr", leg2)     # 50*100
+        self.assertIn("Bought 50 organics for -8000cr", leg2)   # 50*160
+        self.assertEqual(STATE["player"]["organics"], 50)       # back to start
+
+
 class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
     """Entering a sector that holds someone else's mines: damage, survival,
     own-mine safety, and the destruction -> escape-pod path."""

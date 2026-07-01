@@ -71,6 +71,50 @@ walks you through each commodity, your free cargo holds are recalculated
 after every transaction, and you can `cancel` at any point or skip a single
 item.
 
+To free holds without a port, **`jettison`** dumps cargo overboard — a
+pure loss, no credits. `jettison all` clears every hold; `jettison
+<commodity>` dumps one (fuel/organics/equipment); `jettison <commodity> n`
+dumps a set amount. A bare `jettison` just lists what's aboard, so you
+can't space a hold by mistyping. It's a free action, allowed anywhere, and
+never touches a Station Core kit you're carrying (deploy or sell that to
+offload it).
+
+### Port-to-port shuttle (P2P)
+
+Once you've found two adjacent ports that **share a tradeable commodity**
+— one sells something the other buys — `p2p <sector>` automates the shuttle
+run between them so you don't have to hand-trade every hop. This includes
+**exact complements** (each buys what the other sells, for a two-way loop)
+and **partial overlaps** — e.g. a port sitting next to one that *buys
+everything* (`BBB`), where you repeatedly sell a commodity there and rebuy
+it at home in a one-way loop.
+
+* **Setup.** Stand on one of the two ports and run `p2p <adjacent sector>`.
+  The game works out which commodities can flow between the ports and, if
+  there's more than one option, asks **once** which to run (e.g. *"trade
+  fuel+organics or fuel+equipment?"*); if only one shuttle is possible it
+  just asks you to **confirm (`y`/`n`)**. Either reply also starts the run.
+* **Starting cargo.** Your **holds must be full** of the commodity you'll
+  sell on the first hop — P2P never buys your initial load for you. If
+  they're not, it tells you to `jettison` any other cargo and dock (`p`) to
+  buy the right commodity first. (For the rare port that only *buys* all
+  three commodities, you instead start with **empty holds** and buy at the
+  far port first.)
+* **Each leg.** The game moves you one warp (costing **one turn**, exactly
+  like a normal move), auto-docks, **sells your full load and refills your
+  holds** with the return commodity — always at the **listed price**, buying
+  the **maximum** you can carry. It reports what entered, sold, and bought,
+  with both the **leg's profit and a running total**, then asks **"Continue?
+  y/n"**. `y` runs the next leg back the other way; `n`/`stop`/`cancel` ends
+  the run.
+* **It's still real space.** A P2P move is a normal move: if the sector you
+  warp into holds **someone else's mines** or a **non-owner space station**,
+  you're attacked as usual and the shuttle is **abandoned** on the spot.
+* **It ends cleanly** when you stop, run out of turns, or a port can no
+  longer sustain a full load (out of stock to sell you, or no room to buy
+  from you) — in which case the trade is skipped and you're left where you
+  were.
+
 ### Ships & the Stardock
 
 Nine buyable hulls, plus the escape pod you can't buy. Prices climb with
@@ -230,6 +274,8 @@ Send these as direct messages to the game node.
 | `status`| `st` | Show your credits, sector, ship, and turns remaining. |
 | *(number)* | | Move to that sector (plots a route if it isn't adjacent). |
 | `p`     | `port` | Dock to trade, or to refit / visit the shipyard / buy a Station Core kit at a Stardock. |
+| `jettison <what>` | `jet` | Dump cargo from your holds to free up space: `jettison all`, or `jettison <commodity> [n]`. |
+| `p2p <sector>` | | Auto-shuttle trade with an adjacent complementary port; pick a commodity, then `y`/`n` to keep running. |
 | `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). Use `a station` to attack a space station. |
 | `deploy` | | Deploy a carried Space Station Core kit in your current sector (outside Sectors 1–10). |
 | `station` | `dock` | Dock at your own space station here to deposit materials, transfer fighters, power shields, set posture, and upgrade. |
