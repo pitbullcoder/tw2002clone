@@ -11,6 +11,7 @@ import re
 from db import (
     get_port,
     execute_trade,
+    apply_port_restock,
     upgrade_ship_stat,
     buy_ship,
     get_player_with_ship,
@@ -261,6 +262,10 @@ async def cmd_trade(ctx, args):
     if port["port_class"] == "STARDOCK":
         PENDING_UPGRADES[ctx.pubkey] = {"stage": "menu"}
         return build_stardock_menu(p)
+
+    # Docking is a "visit": bring the port's stock up to date first, so the
+    # offers reflect whatever has drifted back since it was last traded.
+    port = apply_port_restock(port["id"])
 
     queue = []
     for label, key in COMMODITIES:

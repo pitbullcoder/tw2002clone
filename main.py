@@ -37,6 +37,7 @@ from db import (
     get_all_warps,
     get_port,
     execute_trade,
+    apply_port_restock,
     move_player_to_sector,
     buy_ship,
     lay_mines,
@@ -1266,6 +1267,9 @@ def _p2p_run_leg(ctx, state):
     dest_port = get_port(dest)
     if dest_port is None:
         return f"Sec{dest} has no port anymore -- P2P ended. Net {_p2p_net(state)}.", True
+    # Bring the destination's stock up to date before checking whether it
+    # can sustain a full load, so drift since the last visit counts.
+    dest_port = apply_port_restock(dest_port["id"])
     ok, reason = _p2p_can_sustain(p, dest_port, sell_key, buy_key)
     if not ok:
         return (

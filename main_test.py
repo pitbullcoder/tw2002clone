@@ -232,6 +232,15 @@ def _stub_execute_trade(player_id, port_id, key, qty, total_price, player_is_buy
         port[f"{key}_qty"] += qty
 
 
+def _stub_apply_port_restock(port_id, now=None):
+    # Unit tests set port stock explicitly, so restock is a no-op here: it
+    # just returns the live port row (looked up by id like _stub_execute_trade).
+    if STATE["ports"]:
+        port = next((p for p in STATE["ports"].values() if p["id"] == port_id), None)
+        return dict(port) if port is not None else None
+    return dict(STATE["port"]) if STATE["port"] else None
+
+
 def _stub_upgrade_ship_stat(player_id, stat_column, qty, total_price):
     STATE["upgrade_log"].append((stat_column, qty, total_price))
     player = STATE["player"]
@@ -609,6 +618,7 @@ def _install_stub_modules():
     db_stub.move_player_to_sector = _stub_move_player_to_sector
     db_stub.spend_turn = _stub_spend_turn
     db_stub.execute_trade = _stub_execute_trade
+    db_stub.apply_port_restock = _stub_apply_port_restock
     db_stub.upgrade_ship_stat = _stub_upgrade_ship_stat
     db_stub.buy_ship = _stub_buy_ship
     db_stub.lay_mines = _stub_lay_mines

@@ -293,5 +293,126 @@ class StationDbTests(unittest.TestCase):
         self.assertIsNone(db.get_station_in_sector(20))
 
 
+class PortRestockTests(unittest.TestCase):
+    """apply_port_restock against a real db: proportional drift of stock
+    toward each commodity's starting level (selling up to capacity, buying
+    down to empty), the NULL-init and same-day no-op paths, and the lazy
+    clock advance."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "restock.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.execute("INSERT INTO sectors (id) VALUES (1)")
+        conn.commit()
+        conn.close()
+
+    def _make_port(self, dirs, qtys, maxes, last_restock, port_class="BSS"):
+        """dirs/qtys/maxes are 3-tuples in (fuel_ore, organics, equipment) order."""
+        conn = db.get_connection()
+        cur = conn.execute(
+            "INSERT INTO ports (sector_id, port_class, "
+            "fuel_ore_dir, organics_dir, equipment_dir, "
+            "fuel_ore_qty, organics_qty, equipment_qty, "
+            "fuel_ore_max, organics_max, equipment_max, last_restock) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (port_class, *dirs, *qtys, *maxes, last_restock),
+        )
+        conn.commit()
+        port_id = cur.lastrowid
+        conn.close()
+        return port_id
+
+    def test_restock_qty_curve(self):
+        # Proportional: each day closes 1/5 of the gap to target.
+        self.assertEqual(db._restock_qty(0, 1000, 1), 200)
+        self.assertEqual(db._restock_qty(0, 1000, 2), 360)
+        self.assertEqual(db._restock_qty(0, 1000, 5), 672)   # not 100% at 5 days
+        self.assertEqual(db._restock_qty(500, 1000, 1), 600)
+        self.assertEqual(db._restock_qty(1000, 0, 1), 800)   # buying drains
+        self.assertEqual(db._restock_qty(1000, 0, 5), 328)
+        self.assertEqual(db._restock_qty(0, 1000, 0), 0)     # no days -> unchanged
+        self.assertEqual(db._restock_qty(1000, 1000, 3), 1000)  # already at target
+
+    def test_selling_refills_up_buying_drains_down(self):
+        # BSS: fuel buys (drains 900->720), organics/equipment sell (refill).
+        port_id = self._make_port(
+            dirs=("B", "S", "S"),
+            qtys=(900, 0, 500),
+            maxes=(1000, 1000, 1000),
+            last_restock="2026-06-10T12:00:00+00:00",
+        )
+        now = datetime(2026, 6, 11, 12, 0, tzinfo=timezone.utc)  # 1 boundary
+        port = db.apply_port_restock(port_id, now=now)
+        self.assertEqual(port["fuel_ore_qty"], 720)     # 900 -> drains 20% of gap-to-0
+        self.assertEqual(port["organics_qty"], 200)     # 0 -> +20% of 1000
+        self.assertEqual(port["equipment_qty"], 600)    # 500 -> +20% of 500 gap
+        self.assertEqual(port["last_restock"], now.isoformat())
+
+    def test_five_days_is_not_full(self):
+        port_id = self._make_port(
+            dirs=("S", "B", "B"),
+            qtys=(0, 1000, 1000),
+            maxes=(1000, 1000, 1000),
+            last_restock="2026-06-10T12:00:00+00:00",
+        )
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)  # 5 boundaries
+        port = db.apply_port_restock(port_id, now=now)
+        self.assertEqual(port["fuel_ore_qty"], 672)     # selling, ~67%
+        self.assertEqual(port["organics_qty"], 328)     # buying, ~33% left
+
+    def test_null_last_restock_just_starts_the_clock(self):
+        port_id = self._make_port(
+            dirs=("S", "S", "S"), qtys=(0, 0, 0), maxes=(1000, 1000, 1000),
+            last_restock=None,
+        )
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        port = db.apply_port_restock(port_id, now=now)
+        self.assertEqual((port["fuel_ore_qty"], port["organics_qty"]), (0, 0))  # no drift
+        self.assertEqual(port["last_restock"], now.isoformat())
+
+    def test_same_day_is_a_noop(self):
+        port_id = self._make_port(
+            dirs=("S", "S", "S"), qtys=(100, 100, 100), maxes=(1000, 1000, 1000),
+            last_restock="2026-06-15T12:00:00+00:00",  # 08:00 ET, after the 3am boundary
+        )
+        now = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)  # same reset-day
+        port = db.apply_port_restock(port_id, now=now)
+        self.assertEqual(port["fuel_ore_qty"], 100)     # unchanged, no boundary crossed
+
+    def test_clock_advances_even_when_at_target(self):
+        # Selling port already full: nothing to add, but the timestamp still
+        # moves forward so days don't pile up.
+        port_id = self._make_port(
+            dirs=("S", "S", "S"), qtys=(1000, 1000, 1000), maxes=(1000, 1000, 1000),
+            last_restock="2026-06-10T12:00:00+00:00",
+        )
+        now = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
+        port = db.apply_port_restock(port_id, now=now)
+        self.assertEqual(port["last_restock"], now.isoformat())
+        self.assertEqual(port["fuel_ore_qty"], 1000)
+
+    def test_stardock_is_left_alone(self):
+        port_id = self._make_port(
+            dirs=(None, None, None), qtys=(0, 0, 0), maxes=(0, 0, 0),
+            last_restock="2026-06-10T12:00:00+00:00", port_class="STARDOCK",
+        )
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        port = db.apply_port_restock(port_id, now=now)  # must not raise
+        self.assertEqual((port["fuel_ore_qty"], port["organics_qty"]), (0, 0))
+
+    def test_lazy_application_is_idempotent_within_a_boundary(self):
+        port_id = self._make_port(
+            dirs=("S", "S", "S"), qtys=(0, 0, 0), maxes=(1000, 1000, 1000),
+            last_restock="2026-06-10T12:00:00+00:00",
+        )
+        now = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)  # 2 boundaries
+        first = db.apply_port_restock(port_id, now=now)
+        second = db.apply_port_restock(port_id, now=now)  # same now -> no further drift
+        self.assertEqual(first["fuel_ore_qty"], 360)
+        self.assertEqual(second["fuel_ore_qty"], 360)
+
+
+
 if __name__ == "__main__":
     unittest.main()

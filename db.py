@@ -58,9 +58,18 @@ def init_db():
             equipment_max INTEGER DEFAULT 0,
             fuel_ore_price INTEGER DEFAULT 0,
             organics_price INTEGER DEFAULT 0,
-            equipment_price INTEGER DEFAULT 0
+            equipment_price INTEGER DEFAULT 0,
+            last_restock TEXT            -- last time stock drifted toward its start level
         )
     """)
+
+    # Migration for galaxies created before ports restocked: the timestamp
+    # apply_port_restock drifts stock from. NULL on existing rows -> the
+    # first access just starts the clock (see apply_port_restock).
+    try:
+        conn.execute("ALTER TABLE ports ADD COLUMN last_restock TEXT")
+    except sqlite3.OperationalError:
+        pass  # already has the column
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS players (
@@ -603,6 +612,86 @@ def execute_trade(player_id, port_id, commodity, qty, total_price, player_is_buy
     )
     conn.commit()
     conn.close()
+
+
+# Number of daily (3am-Eastern) boundaries over which a port's stock drifts
+# back toward its starting level. The drift is proportional -- each boundary
+# closes 1/PORT_RESTOCK_DAYS of the remaining gap to the target -- so the
+# recovery is front-loaded and asymptotic: a fully-drained selling port is
+# ~67% restocked after 5 days and only nudges the last bit closed over the
+# following weeks, so it never snaps straight back to full for a farmer.
+PORT_RESTOCK_DAYS = 5
+
+
+def _restock_qty(qty, target, days):
+    """A commodity's stock after `days` reset-boundaries, closing
+    1/PORT_RESTOCK_DAYS of the gap to `target` each boundary (the gap decays
+    by (1 - 1/PORT_RESTOCK_DAYS) per day). Works both ways: a selling
+    commodity climbs toward its capacity, a buying commodity drains toward
+    zero. Asymptotic -- it only lands exactly on `target` once the remaining
+    gap rounds away."""
+    if days <= 0 or qty == target:
+        return qty
+    remaining_gap = (target - qty) * ((1 - 1 / PORT_RESTOCK_DAYS) ** days)
+    return round(target - remaining_gap)
+
+
+def apply_port_restock(port_id, now=None):
+    """
+    Bring a port's stock up to date lazily, the same way turns and station
+    upkeep work -- there's no background job, so a port catches up the next
+    time anyone trades there. Each tradeable commodity drifts toward its
+    starting level (a selling commodity 'S' toward its capacity, a buying
+    commodity 'B' toward empty) by _restock_qty for the whole run of
+    reset-days since last_restock.
+
+    Persists and returns the refreshed port dict (None if the port is
+    gone). A NULL last_restock -- an old row from before this existed, or a
+    freshly generated galaxy -- just starts the clock with no drift.
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM ports WHERE id = ?", (port_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    port = dict(row)
+    now = now or datetime.now(timezone.utc)
+
+    if port["last_restock"] is None:
+        conn.execute("UPDATE ports SET last_restock = ? WHERE id = ?",
+                     (now.isoformat(), port_id))
+        conn.commit()
+        conn.close()
+        port["last_restock"] = now.isoformat()
+        return port
+
+    days = _reset_days_between(port["last_restock"], now)
+    if days <= 0:
+        conn.close()
+        return port
+
+    updates = {}
+    for c in _TRADEABLE_COMMODITIES:
+        direction = port[f"{c}_dir"]
+        if direction not in ("S", "B"):
+            continue  # dir-less (Stardock) commodities have no stock to drift
+        target = port[f"{c}_max"] if direction == "S" else 0
+        new_qty = _restock_qty(port[f"{c}_qty"], target, days)
+        if new_qty != port[f"{c}_qty"]:
+            updates[f"{c}_qty"] = new_qty
+
+    # Advance the clock even if nothing moved (everything already at target),
+    # so the elapsed days don't pile up and jump the stock next time.
+    columns = list(updates.keys()) + ["last_restock"]
+    values = list(updates.values()) + [now.isoformat()]
+    set_clause = ", ".join(f"{col} = ?" for col in columns)
+    conn.execute(f"UPDATE ports SET {set_clause} WHERE id = ?", values + [port_id])
+    conn.commit()
+    conn.close()
+
+    port.update(updates)
+    port["last_restock"] = now.isoformat()
+    return port
 
 
 _UPGRADEABLE_SHIP_STATS = ("holds_total", "fighters", "shields", "mines", "probes")

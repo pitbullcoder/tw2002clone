@@ -79,6 +79,16 @@ can't space a hold by mistyping. It's a free action, allowed anywhere, and
 never touches a Station Core kit you're carrying (deploy or sell that to
 offload it).
 
+**Ports restock over time.** Trading isn't free of consequences: buying
+drains a selling port's stock, and selling fills a buying port's storage.
+Each port drifts back toward its starting level at the daily **3am Eastern**
+boundary, but only **proportionally** — each day closes a fifth of the
+remaining gap, so recovery is front-loaded and asymptotic (a fully-drained
+port is only ~67% back after five days and never snaps cleanly to 100%).
+There's no background job; a port catches up the next time someone trades
+there. Practically, you can't camp a single lucrative port — work it hard
+and you'll have to let it breathe for a few days.
+
 ### Port-to-port shuttle (P2P)
 
 Once you've found two adjacent ports that **share a tradeable commodity**
@@ -113,7 +123,9 @@ it at home in a one-way loop.
 * **It ends cleanly** when you stop, run out of turns, or a port can no
   longer sustain a full load (out of stock to sell you, or no room to buy
   from you) — in which case the trade is skipped and you're left where you
-  were.
+  were. Because ports only restock gradually (see above), a hard-run shuttle
+  will drain its pair and pause itself; come back in a few days and it's
+  viable again.
 
 ### Ships & the Stardock
 
